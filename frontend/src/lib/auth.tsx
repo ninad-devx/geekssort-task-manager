@@ -1,3 +1,5 @@
+"use client";
+
 import { useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -16,18 +18,25 @@ interface AuthValue {
 
 const AuthContext = createContext<AuthValue | null>(null);
 
+const SESSION_KEY = ["session"];
+
+/**
+ * Reads the session from the query cache. It is never fetched from here: the server
+ * layout (src/app/(app)/layout.tsx) resolves it before the page renders and seeds the
+ * cache. That is what makes an unauthenticated visitor get a real redirect instead of
+ * an endless "Checking your session" spinner.
+ */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const router = useRouter();
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["session"],
+  const { data: session } = useQuery({
+    queryKey: SESSION_KEY,
     queryFn: () => api<SessionInfo>("/auth/me"),
     retry: false,
     staleTime: 30_000,
+    enabled: false, // seeded by the server render; refreshed manually after a mutation
   });
-
-  const session = isLoading ? null : (data ?? null);
 
   const invalidate = useCallback(async () => {
     await queryClient.invalidateQueries();
@@ -36,7 +45,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const loginMutation = useMutation({
     mutationFn: (input: { email: string; password: string }) =>
       api<SessionInfo>("/auth/login", { method: "POST", json: input }),
-    onSuccess: invalidate,
+    onSuccess: (result) => {
+      queryClient.setQueryData(SESSION_KEY, result);
+    },
   });
 
   const logoutMutation = useMutation({

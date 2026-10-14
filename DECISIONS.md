@@ -66,8 +66,10 @@ with the build brief. The choices below fill those gaps.
 
 | ID | Decision |
 |---|---|
-| X-30 | All authenticated pages live in the `src/app/(app)` route group behind one `ProtectedShell`. The route group keeps the URLs flat while giving a single authentication gate (FR-AUTH-012). |
-| X-31 | The `/403` page sits inside the protected group: it is for a signed-in user whose role is insufficient. An unauthenticated visitor is sent to `/login`. |
+| X-30 | All authenticated pages live in the `src/app/(app)` route group behind one server-side gate. Following the Next.js App Router authentication guide, the gate is a Data Access Layer (`src/lib/dal.ts`) that reads the HttpOnly cookie with `cookies()`, calls `/api/auth/me`, and issues `redirect('/login')` when there is no session. The route group keeps URLs flat while giving one gate (FR-AUTH-012). |
+| X-30b | The session is resolved on the server and seeded into the TanStack Query cache, so the client context never fetches it on mount. An earlier client-side effect gate compared `queryClient.getQueryData(['session'])` against `undefined` to detect "still loading"; when the query *errored* with 401 the cache was also `undefined`, so the redirect never fired and the UI sat on "Checking your session" forever. A server redirect cannot deadlock this way. |
+| X-30c | The server gate also redirects to `/change-password` while `must_change_password` is true, rather than letting protected pages render and fail with 403 on every API call. |
+| X-31 | The `/403` page sits inside the protected group: it is for a signed-in user whose role is insufficient. An unauthenticated visitor is sent to `/login`. `/login` is itself server-rendered and redirects an already-signed-in visitor to `/` (or `/change-password`). |
 | X-32 | shadcn/ui components are vendored under `src/components/ui/` (button, card, form primitives, dialog, badge, progress) rather than pulled through the CLI, so the build has no interactive dependency. They follow shadcn conventions. |
 | X-33 | TanStack Query owns all server state; `invalidateQueries()` after every mutation refreshes the task, its logs, the timer and the affected dashboards together, so totals can never drift between views. |
 | X-34 | Dashboard and list queries refetch every 60 s and on window focus, and refetch on `visibilitychange` (FR-DASH-007). No polling continues while the tab is hidden. |

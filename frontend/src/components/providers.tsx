@@ -4,8 +4,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 
 import { AuthProvider } from "@/lib/auth";
+import type { SessionInfo } from "@/lib/types";
 
-export function Providers({ children }: { children: ReactNode }) {
+/**
+ * On public pages (login, change-password) no session is seeded, so `useAuth()` simply
+ * reports no user. On protected pages the server layout seeds it before rendering.
+ */
+export function Providers({
+  children,
+  initialSession,
+}: {
+  children: ReactNode;
+  initialSession?: SessionInfo;
+}) {
   const [client] = useState(
     () =>
       new QueryClient({
@@ -23,6 +34,10 @@ export function Providers({ children }: { children: ReactNode }) {
         },
       }),
   );
+
+  if (initialSession) {
+    client.setQueryData(["session"], initialSession);
+  }
 
   return (
     <QueryClientProvider client={client}>
