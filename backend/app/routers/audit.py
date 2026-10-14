@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import policy
@@ -23,11 +23,28 @@ def _scope(current: CurrentUser) -> Select:
     stmt = select(AuditEvent)
     if policy.can_view_all_tasks(current.user):
         return stmt
-    # members see events on their own tasks (7.2)
+
+    # A member sees only their own trail. Two things are kept out of it:
+    #   - events on tasks that are not theirs (someone else's board is not
+    #     theirs to read), and
+    #   - company-level records that have no task at all — user accounts,
+    #     role permissions — which would otherwise let a member read the
+    #     admin's activity through the global feed.
+    # A member therefore sees their own actions plus changes to their own work.
+    visible_tasks = select(Task.id).where(
+        or_(Task.assignee_id == current.user.id, Task.created_by_id == current.user.id)
+    )
     return stmt.where(
         or_(
-            AuditEvent.actor_id == current.user.id,
-            AuditEvent.task_id.in_(select(Task.id).where(Task.assignee_id == current.user.id)),
+            and_(
+                or_(
+                    AuditEvent.actor_id == current.user.id,
+                    AuditEvent.task_id.in_(visible_tasks),
+                ),
+                AuditEvent.task_id.is_not(None),
+            ),
+            # Non-task records are only visible for the person's own actions.
+            and_(AuditEvent.task_id.is_(None), AuditEvent.actor_id == current.user.id),
         )
     )
 

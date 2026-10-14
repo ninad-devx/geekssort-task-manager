@@ -26,6 +26,9 @@ class UserOut(BaseModel):
     id: int
     email: str
     full_name: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    avatar_color: str | None = None
     role: str
     is_admin: bool
     can_review: bool
@@ -44,6 +47,9 @@ class SessionInfoOut(BaseModel):
 class DirectoryEntry(BaseModel):
     id: int
     full_name: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    avatar_color: str | None = None
     role: str
     is_active: bool
 
@@ -61,6 +67,9 @@ class UserCreateIn(BaseModel):
 
 class UserUpdateIn(BaseModel):
     full_name: str | None = Field(default=None, min_length=1, max_length=200)
+    display_name: str | None = Field(default=None, max_length=200)
+    avatar_url: str | None = Field(default=None, max_length=2048)
+    avatar_color: str | None = Field(default=None, max_length=7)
     role: Role | None = None
     is_admin: bool | None = None
     can_review: bool | None = None
@@ -77,6 +86,101 @@ class DeactivateIn(BaseModel):
 
 class UserCreatedOut(UserOut):
     temporary_password: str | None = None
+
+
+# --- role permissions -------------------------------------------------------
+
+class PermissionInfo(BaseModel):
+    key: str
+    label: str
+
+
+class RolePermissionsOut(BaseModel):
+    role: Role
+    permissions: list[str]
+    defaults: list[str]
+    is_default: bool
+    updated_at: datetime | None = None
+
+
+class PermissionsMatrixOut(BaseModel):
+    permissions: list[PermissionInfo]
+    roles: list[RolePermissionsOut]
+
+
+class RolePermissionsIn(BaseModel):
+    permissions: list[str]
+
+
+# --- time reporting ---------------------------------------------------------
+
+class TimeTaskTotal(BaseModel):
+    task_id: int
+    task_title: str
+    task_status: TaskStatus
+    seconds: int
+    entry_count: int
+
+
+class TimePersonTotal(BaseModel):
+    user: TaskActor
+    seconds: int
+    entry_count: int
+    tasks: list[TimeTaskTotal]
+
+
+class TimeSummaryOut(BaseModel):
+    scope: str
+    days: int
+    total_seconds: int
+    people: list[TimePersonTotal]
+
+
+# --- team tasks grouped by person -------------------------------------------
+
+class PersonRef(BaseModel):
+    id: int
+    full_name: str
+    display_name: str | None = None
+    avatar_url: str | None = None
+    avatar_color: str | None = None
+    role: str
+
+
+class PersonTasksOut(BaseModel):
+    user: PersonRef
+    open_count: int
+    overdue_count: int
+    blocked_count: int
+    tracked_seconds: int
+    tasks: list[TaskOut]
+
+
+class TaskBoardOut(BaseModel):
+    people: list[PersonTasksOut]
+    unassigned_count: int
+    unassigned: list[TaskOut]
+
+
+# --- notifications ----------------------------------------------------------
+
+class NotificationOut(BaseModel):
+    id: int
+    task_id: int
+    task_title: str
+    task_status: TaskStatus
+    actor_name: str
+    actor_id: int | None
+    created_at: datetime
+    is_new: bool
+    is_reminder: bool = False
+    message: str | None = None
+
+
+class NotificationListOut(BaseModel):
+    items: list[NotificationOut]
+    unread: int
+    server_time: datetime
 
 
 # --- tasks -----------------------------------------------------------------
@@ -129,6 +233,31 @@ class StatusChangeIn(BaseModel):
 class ReassignIn(BaseModel):
     assignee_id: int
 
+
+class CategoryOut(BaseModel):
+    slug: str
+    label: str
+    is_active: bool
+    sort_order: int
+    task_count: int = 0
+
+
+class CategoryIn(BaseModel):
+    label: str | None = Field(default=None, max_length=64)
+    sort_order: int | None = None
+    is_active: bool | None = None
+
+
+class RemindIn(BaseModel):
+    message: str | None = Field(default=None, max_length=500)
+
+
+class ReminderOut(BaseModel):
+    task_id: int
+    assignee: PersonRef | None
+    sent_by: PersonRef
+    message: str | None
+    sent_at: datetime
 
 class TaskActor(BaseModel):
     id: int
@@ -205,6 +334,7 @@ class LogEditIn(BaseModel):
 
 
 class PauseIn(BaseModel):
+    log_id: int | None = None
     ended_at: datetime | None = None
     note: str | None = Field(default=None, max_length=2000)
     progress_percent: int | None = Field(default=None, ge=0, le=100)
@@ -252,7 +382,7 @@ class AuditEventOut(BaseModel):
     actor_id: int | None
     actor_name: str
     entity_type: str
-    entity_id: int
+    entity_id: int | None = None
     task_id: int | None
     summary: str
     before: dict[str, Any] | None
@@ -302,6 +432,7 @@ class FolderOut(BaseModel):
 
 class LinkCreateIn(BaseModel):
     folder_id: int | None = None
+    task_id: int | None = None
     title: str = Field(min_length=1, max_length=200)
     url: str = Field(min_length=1, max_length=2048)
     description: str | None = Field(default=None, max_length=1000)
@@ -315,6 +446,7 @@ class LinkCreateIn(BaseModel):
 
 class LinkUpdateIn(BaseModel):
     folder_id: int | None = None
+    task_id: int | None = None
     title: str | None = Field(default=None, min_length=1, max_length=200)
     url: str | None = Field(default=None, min_length=1, max_length=2048)
     description: str | None = Field(default=None, max_length=1000)
@@ -326,11 +458,13 @@ class LinkOut(BaseModel):
     folder_id: int | None
     folder_name: str | None
     folder_visibility: str | None
+    task_id: int | None = None
     title: str
     url: str
     description: str | None
     tags: list[str]
     created_by_id: int | None
+    created_by: PersonRef | None = None
     created_at: datetime
     updated_at: datetime
     allowed_actions: list[str] = Field(default_factory=list)

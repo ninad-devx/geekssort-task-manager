@@ -8,3 +8,4 @@ python-multipart>=0.0.12
 alembic>=1.14
 httpx>=0.28
 pytest>=8.3
+tzdata>=2024.1

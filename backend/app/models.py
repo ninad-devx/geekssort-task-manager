@@ -79,6 +79,7 @@ class EventType(str, enum.Enum):
     task_restored = "task.restored"
     task_status_changed = "task.status_changed"
     task_review_requested = "task.review_requested"
+    task_reminder_sent = "task.reminder_sent"
     task_approved = "task.approved"
     task_revision_requested = "task.revision_requested"
     task_reopened = "task.reopened"
@@ -95,6 +96,9 @@ class EventType(str, enum.Enum):
     link_created = "link.created"
     link_updated = "link.updated"
     link_deleted = "link.deleted"
+    role_permissions_updated = "role.permissions_updated"
+    category_created = "category.created"
+    category_updated = "category.updated"
 
 
 # --- users -----------------------------------------------------------------
@@ -107,6 +111,9 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(200))
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default=Role.member.value, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    avatar_color: Mapped[str | None] = mapped_column(String(7), nullable=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     can_review: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
@@ -115,6 +122,38 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
     sessions: Mapped[list["SessionRow"]] = relationship(back_populates="user")
+
+
+class Category(Base):
+    """A task category an admin can rename or retire without breaking history.
+
+    Tasks store the slug, so a rename is safe; `is_active=false` hides a
+    category from the pickers while leaving existing tasks readable. The row
+    has an integer id because `audit_events.entity_id` is an integer column
+    and every audited entity needs a numeric identity.
+    """
+
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class RolePermission(Base):
+    """An admin's override of a role's default powers. Absent row means defaults."""
+
+    __tablename__ = "role_permissions"
+
+    role: Mapped[str] = mapped_column(String(20), primary_key=True)
+    permissions_json: Mapped[str] = mapped_column(Text, default="[]")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    updated_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class SessionRow(Base):
@@ -213,9 +252,14 @@ class WorkSession(Base):
 
     __table_args__ = (
         CheckConstraint("ended_at IS NULL OR ended_at >= started_at", name="ck_log_interval"),
+        # A person may run several timers at once, but never two on the same
+        # task. Previously this was one running timer per person; that made
+        # switching tasks destroy the previous session, which is exactly the
+        # friction multi-task work hit.
         Index(
-            "uq_running_session_per_user",
+            "uq_running_session_per_user_task",
             "user_id",
+            "task_id",
             unique=True,
             sqlite_where=text("ended_at IS NULL"),
         ),
@@ -282,6 +326,7 @@ class ResourceLink(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     folder_id: Mapped[int | None] = mapped_column(ForeignKey("workspace_folders.id"), nullable=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(200))
     url: Mapped[str] = mapped_column(String(2048))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -292,6 +337,7 @@ class ResourceLink(Base):
     deleted_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     folder: Mapped["Folder | None"] = relationship()
+    creator: Mapped["User | None"] = relationship(foreign_keys=[created_by_id])
     tags: Mapped[list["ResourceLinkTag"]] = relationship(
         back_populates="link", cascade="all, delete-orphan", lazy="selectin"
     )

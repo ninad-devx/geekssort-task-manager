@@ -70,7 +70,13 @@ def test_starting_a_timer_emits_exactly_one_status_event(client, users):
     assert types.count("task.status_changed") == 1
 
 
-def test_only_one_running_timer_per_user_switches_it(client, users):
+def test_timers_run_concurrently_across_tasks(client, users):
+    """A person may genuinely work on two things at once.
+
+    This replaces the old "one running timer per person" rule, which closed the
+    previous session every time the person switched task. The invariant that
+    survives is one running timer per *task*.
+    """
     login(client, "lead@x.com")
     a = task_for(client, title="A", assignee_id=users["m1"])
     b = task_for(client, title="B", assignee_id=users["m1"])
@@ -78,10 +84,18 @@ def test_only_one_running_timer_per_user_switches_it(client, users):
     login(client, "m1@x.com")
 
     first = start(client, a["id"]).json()["log"]
-    r = start(client, b["id"]).json()
-    assert r["paused_previous"] is not None and r["paused_previous"]["id"] == first["id"]
-    assert r["paused_previous"]["ended_at"] is not None
-    assert r["log"]["task_id"] == b["id"]
+    second = start(client, b["id"]).json()
+    assert second["log"]["task_id"] == b["id"]
+    # starting B must not have closed A
+    assert second["paused_previous"] is None
+
+    running = client.get("/api/timer/current").json()["running"]
+    assert {r["task_id"] for r in running} == {a["id"], b["id"]}
+
+    # each timer is paused independently, by log id
+    client.post("/api/timer/pause", headers=CSRF, json={"log_id": first["id"]})
+    still = client.get("/api/timer/current").json()["running"]
+    assert [r["task_id"] for r in still] == [b["id"]]
 
 
 def test_starting_the_same_timer_twice_conflicts(client, users):
@@ -139,7 +153,7 @@ def test_timer_survives_relogin(client, users):
     second = TestClient(app)
     second.post("/api/auth/login", json={"email": "m1@x.com", "password": "Str0ngPassphrase!"})
     running = second.get("/api/timer/current").json()["running"]
-    assert running is not None and running["task_id"] == t["id"]
+    assert len(running) == 1 and running[0]["task_id"] == t["id"]
 
 
 def test_completed_task_cannot_be_tracked(client, users):
@@ -358,7 +372,7 @@ def test_discarding_a_running_timer(client, users):
     running = start(client, t["id"]).json()["log"]
     r = client.delete(f"/api/logs/{running['id']}", headers=CSRF)
     assert r.status_code == 200
-    assert client.get("/api/timer/current").json()["running"] is None
+    assert client.get("/api/timer/current").json()["running"] == []
 
 
 # --- auto close ------------------------------------------------------------
@@ -371,7 +385,7 @@ def test_completion_closes_a_running_timer(client, users):
     assert r.status_code == 200
     logs = client.get(f"/api/tasks/{t['id']}/logs").json()
     assert logs[0]["ended_at"] is not None
-    assert client.get("/api/timer/current").json()["running"] is None
+    assert client.get("/api/timer/current").json()["running"] == []
     paused = [e for e in events(client, t["id"]) if e["event_type"] == "timer.paused"]
     assert paused and paused[0]["meta"]["auto"] is True
 
@@ -381,7 +395,7 @@ def test_blocking_closes_a_running_timer(client, users):
     t = task_for(client)
     start(client, t["id"])
     client.post(f"/api/tasks/{t['id']}/status", headers=CSRF, json={"status": "blocked", "reason": "no assets"})
-    assert client.get("/api/timer/current").json()["running"] is None
+    assert client.get("/api/timer/current").json()["running"] == []
 
 
 def test_reassign_closes_a_running_timer(client, users):
@@ -412,8 +426,12 @@ def test_tracked_seconds_excludes_deleted_and_running(client, users):
     assert detail["running"]["elapsed_seconds"] >= 0
 
 
-def test_partial_unique_index_blocks_two_running_sessions(client, users):
-    """The database itself guarantees one running timer per user (FR-TIME-005)."""
+def test_partial_unique_index_blocks_two_running_sessions_on_one_task(client, users):
+    """The database guarantees one running timer per task, per person.
+
+    Timers are otherwise concurrent, so the index is on (user_id, task_id)
+    rather than user_id alone.
+    """
     login(client, "m1@x.com")
     t = task_for(client)
     start(client, t["id"])

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.orm import Session
 
 from app import audit, policy
@@ -13,6 +13,7 @@ from app.models import (
     Folder,
     ResourceLink,
     ResourceLinkTag,
+    Task,
     Visibility,
     utcnow)
 from app.schemas import (
@@ -59,6 +60,10 @@ def _load_link(current: CurrentUser, db: Session, link_id: int) -> ResourceLink:
     if link.folder_id is not None:
         folder = db.get(Folder, link.folder_id)
         if folder is None or not policy.can_view_folder(current.user, folder):
+            raise not_found("LINK_NOT_FOUND", "Link not found")
+    if link.task_id is not None:
+        task = db.get(Task, link.task_id)
+        if task is None or not policy.can_see_task(current.user, task):
             raise not_found("LINK_NOT_FOUND", "Link not found")
     return link
 
@@ -373,8 +378,14 @@ def list_links(
     visible_ids = select(Folder.id).where(Folder.deleted_at.is_(None))
     if policy.folder_query_scope(current.user) is not None:
         visible_ids = visible_ids.where(Folder.visibility == Visibility.all.value)
+    # A link attached to a task and no folder belongs to that task, not to the
+    # workspace. Without the task_id guard it surfaced in "All folders" with
+    # no folder and no task context, which is exactly where it made no sense.
     stmt = stmt.where(
-        or_(ResourceLink.folder_id.is_(None), ResourceLink.folder_id.in_(visible_ids))
+        or_(
+            and_(ResourceLink.folder_id.is_(None), ResourceLink.task_id.is_(None)),
+            ResourceLink.folder_id.in_(visible_ids),
+        )
     )
     rows = db.scalars(stmt.order_by(ResourceLink.title)).all()
     return [link_out(current.user, link) for link in rows]
@@ -393,9 +404,13 @@ def create_link(payload: LinkCreateIn, current: CurrentUser = Depends(get_curren
         folder = None
         if payload.folder_id is not None:
             folder = _load_folder(current, db, payload.folder_id)
+        task = None
+        if payload.task_id is not None:
+            task = policy.get_visible_task(current.user, payload.task_id, db)
         now = utcnow()
         link = ResourceLink(
             folder_id=folder.id if folder else None,
+            task_id=task.id if task else None,
             title=payload.title.strip(),
             url=payload.url.strip(),
             description=payload.description,
@@ -412,8 +427,15 @@ def create_link(payload: LinkCreateIn, current: CurrentUser = Depends(get_curren
             entity_type="link",
             entity_id=link.id,
             actor=current.user,
+            task_id=task.id if task else None,
             summary=f"Link “{link.title}” added",
-            after={"title": link.title, "url": link.url, "folder_id": link.folder_id, "tags": tags},
+            after={
+                "title": link.title,
+                "url": link.url,
+                "folder_id": link.folder_id,
+                "task_id": link.task_id,
+                "tags": tags,
+            },
             created_at=now,
         )
         db.flush()
@@ -527,7 +549,7 @@ def search(
         .where(
             ResourceLink.deleted_at.is_(None),
             or_(
-                ResourceLink.folder_id.is_(None),
+                and_(ResourceLink.folder_id.is_(None), ResourceLink.task_id.is_(None)),
                 ResourceLink.folder_id.in_(visible_ids),
             ),
             or_(

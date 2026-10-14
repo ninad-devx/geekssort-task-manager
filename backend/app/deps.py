@@ -58,6 +58,12 @@ def load_session(request: Request, db: Session) -> tuple[SessionRow, User]:
         db.commit()
         raise unauthorized()
 
+    # Resolve the role's powers once per request so a permission change made by
+    # an admin applies to the very next request, with no restart.
+    from app.permissions import resolve
+
+    user._resolved_permissions = resolve(db, user.role)
+
     # sliding idle window, written at most every 5 minutes
     if (now - row.last_seen_at) > timedelta(minutes=settings.SESSION_TOUCH_MINUTES):
         row.last_seen_at = now

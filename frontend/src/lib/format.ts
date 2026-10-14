@@ -19,6 +19,20 @@ export function formatDateTime(value: string | null | undefined, timeZone?: stri
   }).format(naiveUtc(value));
 }
 
+/** "14 Jan 2026, 12:10 AM" — the readable form people actually asked for. */
+export function formatReadable(value: string | null | undefined, timeZone?: string): string {
+  if (!value) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone,
+  }).format(naiveUtc(value));
+}
+
 export function formatDate(value: string | null | undefined, timeZone?: string): string {
   if (!value) return "—";
   const d = value.length === 10 ? new Date(`${value}T12:00:00Z`) : naiveUtc(value);

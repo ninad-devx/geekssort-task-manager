@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader, roleLabel } from "@/components/app-shell";
+import { Avatar, displayName } from "@/components/avatar";
 import { useElapsed, useRunningTimer } from "@/components/timer-bar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
@@ -14,7 +15,7 @@ import { Badge } from "@/components/ui/form";
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatDuration, formatHours } from "@/lib/format";
-import { STATUS_LABELS, type DashboardPayload, type TaskStatus } from "@/lib/types";
+import { STATUS_LABELS, type DashboardPayload, type TaskStatus, type WorklistRow } from "@/lib/types";
 
 const STATUS_COLORS: Record<TaskStatus, string> = {
   todo: "var(--color-muted-foreground)",
@@ -29,11 +30,11 @@ export default function DashboardPage() {
   const client = useQueryClient();
 
   const mode = capabilities?.can_view_executive_dashboard ? "executive" : "personal";
-  const [days, setDays] = useState(7);
+  const [period, setPeriod] = useState("week");
 
   const data = useQuery({
-    queryKey: ["dashboard", mode, days],
-    queryFn: () => api<DashboardPayload>(`/dashboard/${mode}${days === 7 ? "" : `?days=${days}`}`),
+    queryKey: ["dashboard", mode, period],
+    queryFn: () => api<DashboardPayload>(`/dashboard/${mode}?period=${period}`),
     refetchInterval: 60_000, // FR-DASH-007
     refetchIntervalInBackground: false,
   });
@@ -68,18 +69,41 @@ export default function DashboardPage() {
   if (!payload) return <Spinner label="Loading dashboard" />;
   const counts = payload.counts;
   const isEmpty = counts.total === 0;
+  const isCompany = mode === "executive";
+  const lists = payload.worklists;
+
+  // A CEO/lead reading a company-wide number must land on the company list.
+  // Pointing them at "My Tasks" silently shows them their own work instead.
+  const taskListBase = isCompany ? "/team-tasks" : "/my-tasks";
+
+  // The card says "completed today" when the period is today, so the list it
+  // opens has to be filtered to the same window or the number and the rows
+  // disagree. "Completed" is measured on completed_at, so that is the date
+  // filter the API filters on.
+  const range = payload.range;
+  const completedWindow =
+    period === "today" && range
+      ? `&completed_from=${String(range.from).slice(0, 10)}&completed_to=${String(range.to).slice(0, 10)}`
+      : period !== "week" && range
+        ? `&completed_from=${String(range.from).slice(0, 10)}&completed_to=${String(range.to).slice(0, 10)}`
+        : "";
 
   return (
     <>
       <PageHeader
         title={title}
-        description={`Last ${days} days · every figure is computed from live records`}
+        description={`${payload.period_label ?? "the selected period"} · every figure is computed from live records`}
         actions={
           <>
-            <Select value={days} onChange={(e) => setDays(Number(e.target.value))} className="h-9 w-auto">
-              <option value={7}>Last 7 days</option>
-              <option value={30}>Last 30 days</option>
-              <option value={90}>Last 90 days</option>
+            <Select
+              value={period}
+              onChange={(e) => setPeriod(e.target.value)}
+              className="h-9 w-auto"
+            >
+              <option value="today">Today</option>
+              <option value="week">Last 7 days</option>
+              <option value="month">Last 30 days</option>
+              <option value="quarter">Last 90 days</option>
             </Select>
             <Button variant="outline" onClick={() => void data.refetch()}>
               <RefreshCw className="h-4 w-4" aria-hidden />
@@ -105,30 +129,29 @@ export default function DashboardPage() {
         <>
           <div className="mb-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <KpiCard
-              label="Open tasks"
-              value={counts.open}
-              href="/my-tasks"
-              hint="Everything not completed"
+              label="In Progress"
+              value={counts.in_progress ?? counts.by_status.in_progress ?? 0}
+              href={`${taskListBase}?status=in_progress`}
+              hint="Being worked on now"
             />
             <KpiCard
-              label="Overdue"
-              value={counts.overdue}
-              href="/team-tasks?overdue=true"
-              hint="Past their due date"
-              tone={counts.overdue > 0 ? "danger" : "default"}
-            />
-            <KpiCard
-              label="Blocked"
-              value={counts.by_status.blocked}
-              href="/team-tasks?status=blocked"
-              hint="Waiting on something"
-              tone={counts.by_status.blocked > 0 ? "danger" : "default"}
+              label="Completed"
+              value={counts.completed_in_range}
+              href={`${taskListBase}?status=completed${completedWindow}`}
+              hint={`Finished ${payload.period_label ?? "in range"}`}
+              tone="success"
             />
             <KpiCard
               label="Tracked time"
               value={formatHours(counts.tracked_seconds)}
-              href="/activity"
-              hint={`${counts.completed_in_range} completed in range`}
+              href="/time"
+              hint={isCompany ? "Who spent it, and on what" : "Your hours, task by task"}
+            />
+            <KpiCard
+              label="Open tasks"
+              value={counts.open}
+              href={taskListBase}
+              hint="Everything not completed"
             />
           </div>
 
@@ -196,7 +219,12 @@ export default function DashboardPage() {
                     ) : (
                       payload.members.map((member) => (
                         <tr key={member.user.id} className="border-b border-border last:border-b-0">
-                          <td className="py-2 font-medium">{member.user.full_name}</td>
+                          <td className="py-2">
+                            <span className="flex items-center gap-2">
+                              <Avatar person={member.user} size="xs" />
+                              <span className="font-medium">{displayName(member.user)}</span>
+                            </span>
+                          </td>
                           <td className="py-2 text-muted-foreground">{roleLabel(member.user.role)}</td>
                           <td className="tabular py-2 text-right">{member.open_tasks}</td>
                           <td className="tabular py-2 text-right">
@@ -225,27 +253,58 @@ export default function DashboardPage() {
             </Card>
           ) : null}
 
-          {payload.needs_attention && payload.needs_attention.blocked.length > 0 ? (
-            <Card className="mt-5 border-destructive/30">
+          {payload.carried_over && payload.carried_over.length > 0 ? (
+            <Card className="mt-5 border-warning/40">
               <CardHeader>
-                <CardTitle>Blocked right now</CardTitle>
+                <CardTitle>Carried over from before today</CardTitle>
               </CardHeader>
               <CardContent>
+                <p className="mb-3 text-sm text-muted-foreground">
+                  These were already open yesterday and are still not done. They did not fall
+                  off the list — they were waiting.
+                </p>
                 <ul className="flex flex-col gap-2">
-                  {payload.needs_attention.blocked.map((row) => (
-                    <li key={row.id} className="text-sm">
-                      <Link href={`/tasks/${row.id}`} className="font-medium hover:underline">
+                  {payload.carried_over.map((row) => (
+                    <li key={row.id} className="flex flex-wrap items-center gap-2 text-sm">
+                      <Badge variant={row.is_overdue ? "warning" : "outline"}>
+                        {row.is_overdue ? `Overdue ${row.due_date}` : STATUS_LABELS[row.status]}
+                      </Badge>
+                      <Link href={`/tasks/${row.id}`} className="min-w-0 flex-1 hover:underline">
                         {row.title}
                       </Link>
-                      <span className="text-muted-foreground"> — {row.blocked_reason}</span>
-                      {row.assignee ? (
-                        <span className="text-xs text-muted-foreground"> ({row.assignee})</span>
+                      {!row.is_overdue && row.due_date ? (
+                        <span className="text-xs text-muted-foreground">due {row.due_date}</span>
                       ) : null}
                     </li>
                   ))}
                 </ul>
               </CardContent>
             </Card>
+          ) : null}
+
+          {lists ? (
+            <>
+              <TaskSection
+                title="In Progress"
+                tone="default"
+                rows={lists.in_progress}
+              />
+              <TaskSection
+                title="Overdue"
+                tone="danger"
+                rows={lists.overdue}
+              />
+              <TaskSection
+                title="Blocked"
+                tone="warning"
+                rows={lists.blocked}
+              />
+              <TaskSection
+                title="Completed"
+                tone="success"
+                rows={lists.completed}
+              />
+            </>
           ) : null}
         </>
       )}
@@ -259,7 +318,7 @@ function Select({
   children,
   className,
 }: {
-  value: number;
+  value: string;
   onChange: (e: React.ChangeEvent<HTMLSelectElement>) => void;
   children: React.ReactNode;
   className?: string;
@@ -286,7 +345,7 @@ function KpiCard({
   value: number | string;
   hint: string;
   href: string;
-  tone?: "default" | "danger";
+  tone?: "default" | "danger" | "success";
 }) {
   return (
     <Link href={href} className="block">
@@ -297,7 +356,11 @@ function KpiCard({
         <CardContent>
           <p
             className={`text-2xl font-semibold tabular ${
-              tone === "danger" ? "text-destructive" : "text-foreground"
+              tone === "danger"
+                ? "text-destructive"
+                : tone === "success"
+                  ? "text-success"
+                  : "text-foreground"
             }`}
           >
             {value}
@@ -306,6 +369,58 @@ function KpiCard({
         </CardContent>
       </Card>
     </Link>
+  );
+}
+
+function TaskSection({
+  title,
+  tone,
+  rows,
+}: {
+  title: string;
+  tone: "default" | "danger" | "warning" | "success";
+  rows: WorklistRow[];
+}) {
+  if (rows.length === 0) return null;
+  const border =
+    tone === "danger"
+      ? "border-destructive/40"
+      : tone === "warning"
+        ? "border-warning/40"
+        : tone === "success"
+          ? "border-success/30"
+          : "";
+
+  return (
+    <Card className={`mt-5 ${border}`}>
+      <CardHeader>
+        <CardTitle>
+          {title} <span className="text-sm font-normal text-muted-foreground">({rows.length})</span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <ul className="flex flex-col gap-2">
+          {rows.map((row) => (
+            <li key={row.id} className="flex flex-wrap items-center gap-2 text-sm">
+              {row.assignee ? <Avatar person={row.assignee} size="xs" /> : null}
+              <Link href={`/tasks/${row.id}`} className="min-w-0 flex-1 hover:underline">
+                {row.title}
+              </Link>
+              {row.is_overdue ? (
+                <Badge variant="warning">overdue {row.due_date}</Badge>
+              ) : row.due_date ? (
+                <span className="text-xs text-muted-foreground">due {row.due_date}</span>
+              ) : null}
+              {row.assignee ? (
+                <span className="text-xs text-muted-foreground">{displayName(row.assignee)}</span>
+              ) : (
+                <span className="text-xs text-muted-foreground">Unassigned</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
   );
 }
 

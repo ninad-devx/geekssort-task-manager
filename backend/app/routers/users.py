@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -26,7 +28,7 @@ from app.schemas import (
     UserOut,
     UserUpdateIn,
 )
-from app.security import generate_temp_password, hash_password, validate_password
+from app.security import generate_temp_password, hash_password, validate_password, validate_url
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -43,6 +45,9 @@ def _out(user: User) -> UserOut:
         id=user.id,
         email=user.email,
         full_name=user.full_name,
+        display_name=user.display_name,
+        avatar_url=user.avatar_url,
+        avatar_color=user.avatar_color,
         role=user.role,
         is_admin=user.is_admin,
         can_review=user.can_review,
@@ -57,6 +62,9 @@ def _created_out(user: User, temporary: str | None) -> UserCreatedOut:
         id=user.id,
         email=user.email,
         full_name=user.full_name,
+        display_name=user.display_name,
+        avatar_url=user.avatar_url,
+        avatar_color=user.avatar_color,
         role=user.role,
         is_admin=user.is_admin,
         can_review=user.can_review,
@@ -92,7 +100,16 @@ def directory(current: CurrentUser = Depends(get_current_user), db: Session = De
     """FR-USER-006: never returns email or flags."""
     rows = db.scalars(select(User).order_by(User.full_name)).all()
     return [
-        DirectoryEntry(id=u.id, full_name=u.full_name, role=u.role, is_active=u.is_active) for u in rows
+        DirectoryEntry(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.display_name,
+            avatar_url=u.avatar_url,
+            avatar_color=u.avatar_color,
+            role=u.role,
+            is_active=u.is_active,
+        )
+        for u in rows
     ]
 
 
@@ -151,12 +168,70 @@ def create_user(
     return result
 
 
+PROFILE_FIELDS = ("display_name", "avatar_url", "avatar_color")
+
+
+def _is_profile_only(payload: UserUpdateIn) -> bool:
+    """True when the caller only wants to edit their own display name or picture."""
+    fields = set(payload.model_dump(exclude_unset=True))
+    return bool(fields) and fields <= set(PROFILE_FIELDS)
+
+
 @router.patch("/{user_id}", response_model=UserOut)
 def update_user(
     user_id: int,
     payload: UserUpdateIn,
-    current: CurrentUser = Depends(require_admin),
+    current: CurrentUser = Depends(get_current_user),
 ):
+    # Everyone may edit their own picture and display name. Anything else on
+    # this endpoint — role, admin flag, activation, another person's profile —
+    # still requires the admin flag.
+    if current.user.id == user_id and _is_profile_only(payload):
+        return _update_own_profile(current, payload)
+    return _admin_update_user(user_id, payload, current)
+
+
+def _apply_profile(db: Session, target: User, payload: UserUpdateIn) -> None:
+    """Copy the profile fields the caller actually sent.
+
+    `model_fields_set` is what distinguishes "not mentioned" from "explicitly
+    null", so an omitted field is left alone while `null` genuinely clears it.
+    """
+    sent = payload.model_fields_set
+    if "display_name" in sent:
+        target.display_name = (payload.display_name or "").strip() or None
+    if "avatar_url" in sent:
+        url = (payload.avatar_url or "").strip()
+        if url:
+            problem = validate_url(url)
+            if problem:
+                raise unprocessable("INVALID_AVATAR_URL", problem)
+        target.avatar_url = url or None
+    if "avatar_color" in sent:
+        color = (payload.avatar_color or "").strip()
+        if color and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            raise unprocessable("INVALID_AVATAR_COLOR", "Colour must be a hex value like #4f46e5")
+        target.avatar_color = color or None
+
+
+def _update_own_profile(current: CurrentUser, payload: UserUpdateIn) -> UserOut:
+    with write_tx() as db:
+        target = db.get(User, current.user.id)
+        if target is None:
+            raise not_found("USER_NOT_FOUND", "User not found")
+        _apply_profile(db, target, payload)
+        target.updated_at = utcnow()
+        db.flush()
+        return _out(target)
+
+
+def _admin_update_user(
+    user_id: int,
+    payload: UserUpdateIn,
+    current: CurrentUser,
+) -> UserOut:
+    if not current.user.is_admin:
+        raise forbidden("ADMIN_ONLY", "This action requires the admin flag")
     with write_tx() as db:
         target = db.get(User, user_id)
         if target is None:
@@ -164,6 +239,7 @@ def update_user(
 
         before = {
             "full_name": target.full_name,
+            "display_name": target.display_name,
             "role": target.role,
             "is_admin": target.is_admin,
             "can_review": target.can_review,
@@ -185,6 +261,7 @@ def update_user(
 
         if payload.full_name is not None:
             target.full_name = payload.full_name.strip()
+        _apply_profile(db, target, payload)
         if new_role is not None:
             target.role = new_role
             if payload.can_review is None:
@@ -213,6 +290,7 @@ def update_user(
 
         after = {
             "full_name": target.full_name,
+            "display_name": target.display_name,
             "role": target.role,
             "is_admin": target.is_admin,
             "can_review": target.can_review,

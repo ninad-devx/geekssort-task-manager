@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app import audit, policy
 from app.config import settings
-from app.errors import conflict, forbidden, unprocessable
+from app.errors import conflict, forbidden, not_found, unprocessable
 from app.models import (
     EntryType,
     EventType,
@@ -196,35 +196,18 @@ def start(db: Session, task: Task, user: User, now: datetime | None = None) -> d
     if task.status == TaskStatus.completed.value:
         raise conflict("TASK_COMPLETED", "A completed task cannot be tracked")
 
-    paused_previous = None
-    existing = db.scalar(
+    # Timers are concurrent: a second task may start while the first keeps
+    # running. Only a duplicate timer on the *same* task is refused.
+    on_this_task = db.scalar(
         select(WorkSession).where(
             WorkSession.user_id == user.id,
+            WorkSession.task_id == task.id,
             WorkSession.ended_at.is_(None),
             WorkSession.deleted_at.is_(None),
         )
     )
-    if existing is not None:
-        if existing.task_id == task.id:
-            raise conflict("TIMER_ALREADY_RUNNING", "This timer is already running")
-        paused_previous = existing
-        previous_task = db.get(Task, existing.task_id)
-        existing.ended_at = now
-        existing.duration_seconds = max(0, int((now - existing.started_at).total_seconds()))
-        db.flush()
-        audit.record(
-            db,
-            event_type=EventType.timer_paused.value,
-            entity_type="task_log",
-            entity_id=existing.id,
-            task_id=existing.task_id,
-            actor=user,
-            summary=f"Timer on “{previous_task.title if previous_task else 'a task'}” paused because another timer started",
-            before={"ended_at": None},
-            after={"ended_at": now, "duration_seconds": existing.duration_seconds},
-            meta={"reason": "switched_task"},
-            created_at=now,
-        )
+    if on_this_task is not None:
+        raise conflict("TIMER_ALREADY_RUNNING", "This timer is already running")
 
     log = WorkSession(
         task_id=task.id,
@@ -270,27 +253,48 @@ def start(db: Session, task: Task, user: User, now: datetime | None = None) -> d
             created_at=now,
         )
 
-    return {"log": log, "paused_previous": paused_previous}
+    return {"log": log, "paused_previous": None}
 
 
 def pause(
     db: Session,
     user: User,
     *,
+    log_id: int | None = None,
     ended_at: datetime | None = None,
     note: str | None = None,
     progress_percent: int | None = None,
     evidence_url: str | None = None,
     now: datetime | None = None,
 ) -> dict:
+    """Close one running timer.
+
+    `log_id` names which one. With several running at once there is no single
+    "current" timer, so the caller must say; without it we fall back to the most
+    recently started, which is what a single-timer caller expects.
+    """
     now = now or utcnow()
-    log = db.scalar(
-        select(WorkSession).where(
-            WorkSession.user_id == user.id,
-            WorkSession.ended_at.is_(None),
-            WorkSession.deleted_at.is_(None),
+    if log_id is not None:
+        log = db.scalar(
+            select(WorkSession).where(
+                WorkSession.id == log_id,
+                WorkSession.user_id == user.id,
+                WorkSession.ended_at.is_(None),
+                WorkSession.deleted_at.is_(None),
+            )
         )
-    )
+        if log is None:
+            raise not_found("NO_RUNNING_TIMER", "That timer is not running")
+    else:
+        log = db.scalar(
+            select(WorkSession)
+            .where(
+                WorkSession.user_id == user.id,
+                WorkSession.ended_at.is_(None),
+                WorkSession.deleted_at.is_(None),
+            )
+            .order_by(WorkSession.started_at.desc(), WorkSession.id.desc())
+        )
     if log is None:
         raise conflict("NO_RUNNING_TIMER", "You have no running timer")
 

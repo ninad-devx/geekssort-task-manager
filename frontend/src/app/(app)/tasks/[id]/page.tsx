@@ -50,6 +50,8 @@ import {
   EVENT_LABELS,
   STATUS_LABELS,
   type AuditEvent,
+  type Folder,
+  type ResourceLink,
   type Task,
   type TaskLog,
   type TaskStatus,
@@ -64,7 +66,9 @@ export default function TaskDetailPage({ params }: PageProps<"/tasks/[id]">) {
   const client = useQueryClient();
   const { capabilities } = useAuth();
   const [tab, setTab] = useState<Tab>("log");
-  const [dialog, setDialog] = useState<null | "add_time" | "note" | "status" | "assign" | "edit">(null);
+  const [dialog, setDialog] = useState<
+    null | "add_time" | "note" | "status" | "assign" | "edit" | "link"
+  >(null);
 
   const task = useQuery({
     queryKey: ["task", id],
@@ -84,6 +88,12 @@ export default function TaskDetailPage({ params }: PageProps<"/tasks/[id]">) {
     queryKey: ["audit", "task", id],
     queryFn: () => api<{ items: AuditEvent[] }>(`/audit${qs({ task_id: id, page_size: 100 })}`),
     enabled: Number.isFinite(id) && tab === "history",
+  });
+
+  const taskLinks = useQuery({
+    queryKey: ["task", id, "links"],
+    queryFn: () => api<ResourceLink[]>(`/tasks/${id}/links`),
+    enabled: Number.isFinite(id),
   });
 
   const invalidate = () => client.invalidateQueries();
@@ -133,9 +143,7 @@ export default function TaskDetailPage({ params }: PageProps<"/tasks/[id]">) {
         description={t.assignee ? `Assigned to ${t.assignee.full_name}` : "Unassigned"}
         actions={
           <>
-            {actions.includes("start_timer") ||
-            actions.includes("pause_timer") ||
-            actions.includes("switch_timer") ? (
+            {actions.includes("start_timer") || actions.includes("pause_timer") ? (
               <TimerActions task={t} onChanged={invalidate} size="default" />
             ) : null}
             {actions.includes("change_status") ? (
@@ -270,6 +278,36 @@ export default function TaskDetailPage({ params }: PageProps<"/tasks/[id]">) {
                   </a>
                 </Detail>
               ) : null}
+              <Detail label="Links">
+                <div className="flex flex-col gap-1">
+                  {(taskLinks.data ?? []).length === 0 ? (
+                    <span className="text-muted-foreground">None attached to this task</span>
+                  ) : (
+                    (taskLinks.data ?? []).map((link) => (
+                      <a
+                        key={link.id}
+                        href={link.url}
+                        target="_blank"
+                        rel="noopener noreferrer nofollow"
+                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                      >
+                        <Link2 className="h-3.5 w-3.5" aria-hidden />
+                        {link.title}
+                      </a>
+                    ))
+                  )}
+                  {capabilities?.can_add_links ? (
+                    <button
+                      type="button"
+                      className="mt-1 inline-flex w-fit items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                      onClick={() => setDialog("link")}
+                    >
+                      <Plus className="h-3 w-3" aria-hidden />
+                      Attach a link
+                    </button>
+                  ) : null}
+                </div>
+              </Detail>
               <Detail label="Created by">{t.created_by?.full_name ?? "—"}</Detail>
               <Detail label="Created">{formatDateTime(t.created_at)}</Detail>
               {t.completed_at ? (
@@ -282,6 +320,12 @@ export default function TaskDetailPage({ params }: PageProps<"/tasks/[id]">) {
 
       <AddTimeDialog
         open={dialog === "add_time"}
+        onClose={() => setDialog(null)}
+        taskId={t.id}
+        onDone={invalidate}
+      />
+      <AttachLinkDialog
+        open={dialog === "link"}
         onClose={() => setDialog(null)}
         taskId={t.id}
         onDone={invalidate}
@@ -453,7 +497,7 @@ function LogRow({
   onDelete: () => void;
 }) {
   const timer = useRunningTimer();
-  const running = timer.data?.running;
+  const mine = timer.data?.running ?? [];
   const elapsed = useElapsed(log.ended_at ? undefined : log.started_at, timer.data?.server_time);
 
   const isRunning = log.ended_at === null;
@@ -473,7 +517,7 @@ function LogRow({
           </Badge>
           {log.edit_count > 0 ? <Badge variant="warning">Edited ({log.edit_count})</Badge> : null}
           {log.deleted_at ? <Badge variant="danger">Deleted</Badge> : null}
-          {isRunning && running?.is_stale && running.log_id === log.id ? (
+          {isRunning && mine?.some((r) => r.log_id === log.id && r.is_stale) ? (
             <Badge variant="warning">Stale</Badge>
           ) : null}
         </div>
@@ -729,6 +773,92 @@ function NoteDialog({
         </Field>
         <Field label="Evidence URL" hint="Optional">
           <Input value={evidence} onChange={(e) => setEvidence(e.target.value)} />
+        </Field>
+      </div>
+    </Dialog>
+  );
+}
+
+function AttachLinkDialog({
+  open,
+  onClose,
+  taskId,
+  onDone,
+}: {
+  open: boolean;
+  onClose: () => void;
+  taskId: number;
+  onDone: () => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [url, setUrl] = useState("");
+  const [folderId, setFolderId] = useState("");
+
+  const folders = useQuery({
+    queryKey: ["folders"],
+    queryFn: () => api<Folder[]>(`/workspace/folders`),
+    enabled: open,
+  });
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api<ResourceLink>("/workspace/links", {
+        method: "POST",
+        json: {
+          task_id: taskId,
+          folder_id: folderId ? Number(folderId) : null,
+          title: title.trim(),
+          url: url.trim(),
+        },
+      }),
+    onSuccess: async () => {
+      toast.success("Link attached");
+      setTitle("");
+      setUrl("");
+      onClose();
+      await onDone();
+    },
+    onError: (error) =>
+      toast.error(error instanceof ApiError ? error.message : "Could not attach the link"),
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title="Attach a link to this task"
+      description="Reference material, a draft, a live campaign — anything this task should point at."
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            onClick={() => mutation.mutate()}
+            loading={mutation.isPending}
+            disabled={!title.trim() || !url.trim()}
+          >
+            Attach
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        <Field label="Title">
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={200} />
+        </Field>
+        <Field label="URL" hint="Must start with http:// or https://">
+          <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…" />
+        </Field>
+        <Field label="Also file in a workspace folder" hint="Optional">
+          <Select value={folderId} onChange={(e) => setFolderId(e.target.value)}>
+            <option value="">Task only</option>
+            {(folders.data ?? []).map((folder) => (
+              <option key={folder.id} value={folder.id}>
+                {folder.name}
+              </option>
+            ))}
+          </Select>
         </Field>
       </div>
     </Dialog>

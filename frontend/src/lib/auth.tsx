@@ -14,6 +14,11 @@ interface AuthValue {
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   changePassword: (current: string, next: string) => Promise<void>;
+  updateProfile: (input: {
+    display_name?: string | null;
+    avatar_url?: string | null;
+    avatar_color?: string | null;
+  }) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthValue | null>(null);
@@ -65,6 +70,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     onSuccess: invalidate,
   });
 
+  // Editing your own display name, picture or colour is allowed for everybody,
+  // so it deliberately does not go through the admin-only users endpoint.
+  const updateProfileMutation = useMutation({
+    mutationFn: (input: {
+      display_name?: string | null;
+      avatar_url?: string | null;
+      avatar_color?: string | null;
+    }) => api<User>(`/users/${session?.user.id}`, { method: "PATCH", json: input }),
+    onSuccess: async () => {
+      await invalidate();
+    },
+  });
+
   const value = useMemo<AuthValue>(
     () => ({
       user: session?.user ?? null,
@@ -82,8 +100,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           new_password: newPassword,
         });
       },
+      updateProfile: async (input) => {
+        await updateProfileMutation.mutateAsync(input);
+      },
     }),
-    [session, loginMutation, logoutMutation, changePasswordMutation],
+    [session, loginMutation, logoutMutation, changePasswordMutation, updateProfileMutation],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

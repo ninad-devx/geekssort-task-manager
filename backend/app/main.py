@@ -13,7 +13,7 @@ from app.db import init_db
 from app.deps import enforce_csrf, set_request_context
 from app.errors import AppError
 from app.routers import audit as audit_router
-from app.routers import auth, dashboard, logs, tasks, users, workspace
+from app.routers import auth, categories, dashboard, logs, notifications, permissions, tasks, users, workspace
 
 
 @asynccontextmanager
@@ -66,7 +66,7 @@ async def validation_handler(_request: Request, exc: RequestValidationError):
     )
 
 
-for r in (auth.router, users.router, tasks.router, logs.router, audit_router.router, dashboard.router, workspace.router):
+for r in (auth.router, users.router, tasks.router, logs.router, audit_router.router, dashboard.router, workspace.router, permissions.router, notifications.router, categories.router):
     app.include_router(r, prefix="/api")
 
 

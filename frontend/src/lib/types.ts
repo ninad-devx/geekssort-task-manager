@@ -6,6 +6,9 @@ export interface User {
   id: number;
   email: string;
   full_name: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  avatar_color: string | null;
   role: Role;
   is_admin: boolean;
   can_review: boolean;
@@ -26,6 +29,49 @@ export interface Capabilities {
   can_edit_time: boolean;
 }
 
+export interface Notification {
+  id: number;
+  task_id: number;
+  task_title: string;
+  task_status: TaskStatus;
+  actor_name: string;
+  actor_id: number | null;
+  created_at: string;
+  is_new: boolean;
+  is_reminder?: boolean;
+  message?: string | null;
+}
+
+export interface NotificationList {
+  items: Notification[];
+  unread: number;
+  server_time: string;
+}
+
+export interface PersonRef {
+  id: number;
+  full_name: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  avatar_color: string | null;
+  role: Role;
+}
+
+export interface PersonTasks {
+  user: PersonRef;
+  open_count: number;
+  overdue_count: number;
+  blocked_count: number;
+  tracked_seconds: number;
+  tasks: Task[];
+}
+
+export interface TaskBoard {
+  people: PersonTasks[];
+  unassigned_count: number;
+  unassigned: Task[];
+}
+
 export interface SessionInfo {
   user: User;
   capabilities: Capabilities;
@@ -36,6 +82,9 @@ export interface SessionInfo {
 export interface DirectoryEntry {
   id: number;
   full_name: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  avatar_color: string | null;
   role: Role;
   is_active: boolean;
 }
@@ -151,6 +200,8 @@ export interface DashboardCounts {
   overdue: number;
   due_today: number;
   completed_in_range: number;
+  in_progress?: number;
+  blocked?: number;
   tracked_seconds: number;
 }
 
@@ -162,6 +213,7 @@ export interface DashboardPayload {
   working_now: WorkingNowRow[];
   members?: MemberLoad[];
   needs_attention?: { in_review: number; blocked: BlockedRow[] };
+  carried_over?: CarriedRow[];
   attention?: {
     due_today: number;
     overdue: number;
@@ -170,6 +222,23 @@ export interface DashboardPayload {
   };
   daily?: { day: string; seconds: number }[];
   running?: RunningTimer | null;
+  period?: string;
+  period_label?: string;
+  worklists?: {
+    in_progress: WorklistRow[];
+    completed: WorklistRow[];
+    overdue: WorklistRow[];
+    blocked: WorklistRow[];
+  };
+}
+
+export interface WorklistRow {
+  id: number;
+  title: string;
+  status: TaskStatus;
+  due_date: string | null;
+  is_overdue: boolean;
+  assignee: PersonRef | null;
 }
 
 export interface MemberLoad {
@@ -183,6 +252,14 @@ export interface BlockedRow {
   title: string;
   blocked_reason: string | null;
   assignee: string | null;
+}
+
+export interface CarriedRow {
+  id: number;
+  title: string;
+  status: TaskStatus;
+  due_date: string | null;
+  is_overdue: boolean;
 }
 
 export interface Folder {
@@ -203,11 +280,13 @@ export interface ResourceLink {
   folder_id: number | null;
   folder_name: string | null;
   folder_visibility: "all" | "management" | null;
+  task_id: number | null;
   title: string;
   url: string;
   description: string | null;
   tags: string[];
   created_by_id: number | null;
+  created_by?: PersonRef | null;
   created_at: string;
   updated_at: string;
   allowed_actions: string[];
@@ -242,6 +321,14 @@ export const CATEGORY_LABELS: Record<string, string> = {
   company_resources: "Company resources",
   other: "Other",
 };
+
+export interface Category {
+  slug: string;
+  label: string;
+  is_active: boolean;
+  sort_order: number;
+  task_count: number;
+}
 
 export const EVENT_LABELS: Record<string, string> = {
   "user.created": "User created",

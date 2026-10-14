@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app import policy, timelog
@@ -16,6 +16,9 @@ from app.schemas import (
     PauseIn,
     PauseOut,
     StartOut,
+    TimePersonTotal,
+    TimeSummaryOut,
+    TimeTaskTotal,
 )
 from app.serializers import log_out, task_out
 
@@ -76,6 +79,7 @@ def pause_timer(payload: PauseIn, current: CurrentUser = Depends(get_current_use
         result = timelog.pause(
             db,
             current.user,
+            log_id=payload.log_id,
             ended_at=payload.ended_at,
             note=payload.note,
             progress_percent=payload.progress_percent,
@@ -94,23 +98,120 @@ def pause_timer(payload: PauseIn, current: CurrentUser = Depends(get_current_use
 
 @router.get("/timer/current")
 def current_timer(current: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
-    from app.serializers import elapsed, is_stale, running_session_for_user
+    from app.serializers import elapsed, is_stale, running_sessions_for_user
 
-    log = running_session_for_user(db, current.user.id)
-    if log is None:
-        return {"running": None, "server_time": utcnow()}
-    task = db.get(Task, log.task_id)
+    rows = running_sessions_for_user(db, current.user.id)
+    if not rows:
+        return {"running": [], "server_time": utcnow()}
     return {
-        "running": {
-            "log_id": log.id,
-            "task_id": log.task_id,
-            "task_title": task.title if task else "Task",
-            "started_at": log.started_at,
-            "elapsed_seconds": elapsed(log),
-            "is_stale": is_stale(log),
-        },
+        "running": [
+            {
+                "log_id": log.id,
+                "task_id": log.task_id,
+                "task_title": (db.get(Task, log.task_id).title if db.get(Task, log.task_id) else "Task"),
+                "started_at": log.started_at,
+                "elapsed_seconds": elapsed(log),
+                "is_stale": is_stale(log),
+            }
+            for log in rows
+        ],
         "server_time": utcnow(),
     }
+
+
+# --- time reporting ---------------------------------------------------------
+
+@router.get("/time/summary", response_model=TimeSummaryOut)
+def time_summary(
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    days: int = Query(default=30, ge=1, le=365),
+    user_id: int | None = Query(default=None),
+):
+    """Tracked time rolled up per person and per task.
+
+    An employee sees only their own hours. A CEO or team lead sees everyone's,
+    which is what makes the company figure drillable: company -> person -> task.
+    Raw per-timer rows stay on the task page; this is the summary people
+    actually read.
+    """
+    from datetime import timedelta
+
+    from app.models import User
+    from app.serializers import actor_out
+
+    end = utcnow()
+    start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    sees_everyone = policy.can_view_all_tasks(current.user)
+
+    conditions = [
+        WorkSession.deleted_at.is_(None),
+        WorkSession.started_at >= start,
+        WorkSession.started_at <= end,
+        WorkSession.entry_type == EntryType.work_session.value,
+    ]
+    if not sees_everyone:
+        conditions.append(WorkSession.user_id == current.user.id)
+    elif user_id is not None:
+        conditions.append(WorkSession.user_id == user_id)
+
+    scope = policy.task_query_scope(current.user)
+    if scope is not None:
+        conditions.append(scope)
+
+    rows = db.execute(
+        select(
+            WorkSession.user_id,
+            WorkSession.task_id,
+            func.coalesce(func.sum(WorkSession.duration_seconds), 0),
+            func.count(),
+        )
+        .join(Task, Task.id == WorkSession.task_id)
+        .where(*conditions)
+        .group_by(WorkSession.user_id, WorkSession.task_id)
+    ).all()
+
+    by_person: dict[int, dict[int, tuple[int, int]]] = {}
+    for uid, tid, seconds, count in rows:
+        by_person.setdefault(uid, {})[tid] = (int(seconds or 0), int(count or 0))
+
+    people: list[TimePersonTotal] = []
+    for uid, tasks in sorted(by_person.items(), key=lambda kv: -sum(v[0] for v in kv[1].values())):
+        user = db.get(User, uid)
+        if user is None:
+            continue
+        task_totals: list[TimeTaskTotal] = []
+        for tid, (seconds, count) in sorted(
+            tasks.items(), key=lambda kv: -kv[1][0]
+        ):
+            task = db.get(Task, tid)
+            if task is None:
+                continue
+            task_totals.append(
+                TimeTaskTotal(
+                    task_id=task.id,
+                    task_title=task.title,
+                    task_status=task.status,
+                    seconds=seconds,
+                    entry_count=count,
+                )
+            )
+        people.append(
+            TimePersonTotal(
+                user=actor_out(user),
+                seconds=sum(t.seconds for t in task_totals),
+                entry_count=sum(t.entry_count for t in task_totals),
+                tasks=task_totals,
+            )
+        )
+
+    return TimeSummaryOut(
+        scope="company" if sees_everyone else "self",
+        days=days,
+        total_seconds=sum(p.seconds for p in people),
+        people=people,
+    )
 
 
 # --- manual entries and notes ----------------------------------------------

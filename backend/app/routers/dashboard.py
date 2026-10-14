@@ -35,6 +35,37 @@ def _range(days: int) -> tuple[datetime, datetime]:
     return start_local.astimezone(tz).replace(tzinfo=None), end_local.astimezone(tz).replace(tzinfo=None)
 
 
+def _period(period: str) -> tuple[datetime, datetime]:
+    """A named window: today, week, month, or the trailing N days.
+
+    `today` is what people reach for first — "what happened today" is a
+    different question from "what happened in the last seven days".
+    """
+    if period == "today":
+        today = local_today()
+        tz = settings.tz
+        start = datetime.combine(today, time.min, tzinfo=tz)
+        end = datetime.combine(today, time.max, tzinfo=tz)
+        return start.astimezone(tz).replace(tzinfo=None), end.astimezone(tz).replace(tzinfo=None)
+    if period == "week":
+        return _range(7)
+    if period == "month":
+        return _range(30)
+    if period == "quarter":
+        return _range(90)
+    return _range(7)
+
+
+def _period_label(period: str, days: int) -> str:
+    if period == "today":
+        return "today"
+    if period == "month":
+        return "the last 30 days"
+    if period == "quarter":
+        return "the last 90 days"
+    return f"the last {days} days"
+
+
 def _visible_tasks(current: CurrentUser) -> Select:
     stmt = select(Task).where(Task.deleted_at.is_(None))
     if not policy.can_view_all_tasks(current.user):
@@ -172,6 +203,8 @@ def _base_payload(db: Session, current: CurrentUser, stmt: Select, start: dateti
             "overdue": overdue,
             "due_today": due_today,
             "completed_in_range": completed,
+            "in_progress": counts.get(TaskStatus.in_progress.value, 0),
+            "blocked": counts.get(TaskStatus.blocked.value, 0),
             "tracked_seconds": _tracked(db, stmt, start, end),
         },
         "working_now": _working_now(db, current),
@@ -183,12 +216,15 @@ def executive(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
     days: int = Query(default=7, ge=1, le=90),
+    period: str = Query(default="week"),
 ):
     if not policy.capabilities(current.user)["can_view_executive_dashboard"]:
         raise forbidden("FORBIDDEN", "The executive dashboard is for the CEO and team lead")
-    start, end = _range(days)
+    start, end = _period(period)
     stmt = _visible_tasks(current)
     payload = _base_payload(db, current, stmt, start, end)
+    payload["period"] = period
+    payload["period_label"] = _period_label(period, days)
     payload["members"] = _member_load(db, stmt, start, end)
     return payload
 
@@ -198,18 +234,21 @@ def lead(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
     days: int = Query(default=7, ge=1, le=90),
+    period: str = Query(default="week"),
     assignee_id: int | None = Query(default=None),
     category: str | None = Query(default=None),
 ):
     if not policy.capabilities(current.user)["can_view_lead_dashboard"]:
         raise forbidden("FORBIDDEN", "The team lead dashboard is for the CEO and team lead")
-    start, end = _range(days)
+    start, end = _period(period)
     stmt = _visible_tasks(current)
     if assignee_id is not None:
         stmt = stmt.where(Task.assignee_id == assignee_id)
     if category:
         stmt = stmt.where(Task.category == category)
     payload = _base_payload(db, current, stmt, start, end)
+    payload["period"] = period
+    payload["period_label"] = _period_label(period, days)
     payload["members"] = _member_load(db, stmt, start, end)
 
     sub = _alias(stmt)
@@ -243,8 +282,9 @@ def personal(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
     days: int = Query(default=7, ge=1, le=90),
+    period: str = Query(default="week"),
 ):
-    start, end = _range(days)
+    start, end = _period(period)
     stmt = select(Task).where(Task.deleted_at.is_(None), Task.assignee_id == current.user.id)
     payload = _base_payload(db, current, stmt, start, end)
 
@@ -281,7 +321,114 @@ def personal(
         "blocked": _count(sub.c.status == TaskStatus.blocked.value),
         "in_review": _count(sub.c.status == TaskStatus.in_review.value),
     }
+
+    # Carry-forward: work that was already open before today and is still not
+    # done. These tasks never leave the database, but without this list they are
+    # invisible the moment the day rolls over, which is exactly the work someone
+    # forgot they had.
+    carried = db.execute(
+        select(sub.c.id, sub.c.title, sub.c.status, sub.c.due_date, sub.c.created_at)
+        .select_from(sub)
+        .where(
+            sub.c.status.in_(
+                (TaskStatus.todo.value, TaskStatus.in_progress.value, TaskStatus.blocked.value)
+            ),
+            sub.c.created_at < datetime.combine(today, time.min),
+        )
+        .order_by(sub.c.due_date.is_(None), sub.c.due_date.asc(), sub.c.created_at.asc())
+        .limit(25)
+    ).all()
+    payload["carried_over"] = [
+        {
+            "id": r[0],
+            "title": r[1],
+            "status": r[2],
+            "due_date": str(r[3]) if r[3] else None,
+            "is_overdue": bool(r[3]) and r[3] < today,
+        }
+        for r in carried
+    ]
+
     running = running_session_for_user(db, current.user.id)
+    payload["worklists"] = _worklists(db, stmt, today)
+    payload["period"] = period
+    payload["period_label"] = _period_label(period, days)
+    if running is not None:
+        payload["running"] = {
+            "log_id": running.id,
+            "task_id": running.task_id,
+            "task_title": (db.get(Task, running.task_id).title if db.get(Task, running.task_id) else "Task"),
+            "started_at": running.started_at,
+            "elapsed_seconds": 0,
+            "is_stale": False,
+        }
+    return payload
+
+
+def _worklists(db: Session, stmt: Select, today) -> dict:
+    """The four lists the dashboard shows as sections: what is moving, what is
+    done, and what is slipping. Cards carry the numbers; these carry the work."""
+    sub = _alias(stmt)
+    base = (sub.c.deleted_at.is_(None),)
+
+    def rows(*conditions):
+        result = db.execute(
+            select(
+                sub.c.id,
+                sub.c.title,
+                sub.c.status,
+                sub.c.due_date,
+                User.id,
+                User.full_name,
+                User.display_name,
+                User.avatar_url,
+                User.avatar_color,
+                User.role,
+            )
+            .select_from(sub.outerjoin(User, User.id == sub.c.assignee_id))
+            .where(*base, *conditions)
+            .order_by(sub.c.due_date.is_(None), sub.c.due_date.asc(), sub.c.id.asc())
+            .limit(25)
+        ).all()
+        return [
+            {
+                "id": r[0],
+                "title": r[1],
+                "status": r[2],
+                "due_date": str(r[3]) if r[3] else None,
+                "is_overdue": bool(r[3]) and r[3] < today,
+                "assignee": (
+                    {
+                        "id": r[4],
+                        "full_name": r[5],
+                        "display_name": r[6],
+                        "avatar_url": r[7],
+                        "avatar_color": r[8],
+                        "role": r[9],
+                    }
+                    if r[4] is not None
+                    else None
+                ),
+            }
+            for r in result
+        ]
+
+    return {
+        "in_progress": rows(sub.c.status == TaskStatus.in_progress.value),
+        "completed": rows(
+            sub.c.status == TaskStatus.completed.value,
+            sub.c.completed_at.is_not(None),
+        ),
+        "overdue": rows(
+            sub.c.due_date.is_not(None),
+            sub.c.due_date < today,
+            sub.c.status != TaskStatus.completed.value,
+        ),
+        "blocked": rows(
+            sub.c.status == TaskStatus.blocked.value,
+            sub.c.blocked_reason.is_not(None),
+        ),
+    }
     payload["running"] = None
     if running is not None:
         task = db.get(Task, running.task_id)

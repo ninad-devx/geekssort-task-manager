@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import audit, policy, timelog, workflow
@@ -15,15 +15,21 @@ from app.models import EventType, Priority, Task, TaskStatus, User, utcnow
 from app.schemas import (
     CORE_FIELDS,
     PROGRESS_FIELDS,
+    LinkOut,
+    PersonRef,
+    PersonTasksOut,
     ReassignIn,
+    RemindIn,
+    ReminderOut,
     StatusChangeIn,
+    TaskBoardOut,
     TaskCreateIn,
     TaskListOut,
     TaskOut,
     TaskUpdateIn,
 )
 from app.security import validate_evidence_url
-from app.serializers import is_overdue, local_today, task_out
+from app.serializers import is_overdue, local_today, task_out, tracked_seconds
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -75,7 +81,7 @@ def create_task(payload: TaskCreateIn, current: CurrentUser = Depends(get_curren
         raise forbidden("CANNOT_CREATE_TASKS", "Creating tasks is disabled for your role")
 
     assignee_id = payload.assignee_id
-    if policy.is_manager(user):
+    if policy.can_assign_to_others(user):
         if assignee_id is None:
             assignee_id = user.id
     else:
@@ -150,6 +156,7 @@ def list_tasks(
     completed_from: date | None = Query(default=None),
     completed_to: date | None = Query(default=None),
     include_deleted: bool = Query(default=False),
+    mine: bool = Query(default=False),
     sort: str = Query(default="due"),
     order: str = Query(default="asc"),
     page: int = Query(default=1, ge=1),
@@ -157,6 +164,17 @@ def list_tasks(
 ):
     user = current.user
     stmt = _base_query(current)
+
+    # "My Tasks" means work assigned to me, plus anything I raised that nobody
+    # has taken yet. Work I handed to someone else is deliberately excluded and
+    # belongs on Team Tasks — otherwise a lead sees the whole company here.
+    if mine:
+        stmt = stmt.where(
+            or_(
+                Task.assignee_id == user.id,
+                and_(Task.created_by_id == user.id, Task.assignee_id.is_(None)),
+            )
+        )
 
     if include_deleted:
         if not policy.can_view_all_tasks(user):
@@ -215,6 +233,173 @@ def list_tasks(
         page=page,
         page_size=page_size,
     )
+
+
+@router.get("/board", response_model=TaskBoardOut)
+def task_board(
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    status: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    include_completed: bool = Query(default=False),
+    completed_from: date | None = Query(default=None),
+    completed_to: date | None = Query(default=None),
+):
+    """Every visible task bucketed by the person who owns it.
+
+    The flat list answers "what is open"; this answers "who is carrying what",
+    which is what a CEO or lead actually reads. It reuses the caller's normal
+    task scope, so a member calling it still only ever sees their own work.
+    """
+    from app.serializers import is_overdue, local_today, tracked_seconds
+
+    user = current.user
+    if not policy.can_view_all_tasks(user):
+        raise forbidden("FORBIDDEN", "The team board is for the CEO and team lead")
+
+    stmt = _base_query(current).where(Task.deleted_at.is_(None))
+    if status:
+        stmt = stmt.where(Task.status == status)
+    elif not include_completed:
+        stmt = stmt.where(Task.status != TaskStatus.completed.value)
+    if q:
+        stmt = stmt.where(Task.title.ilike(f"%{q.strip()}%"))
+    if completed_from:
+        stmt = stmt.where(
+            Task.completed_at >= datetime.combine(completed_from, datetime.min.time())
+        )
+    if completed_to:
+        stmt = stmt.where(
+            Task.completed_at <= datetime.combine(completed_to, datetime.max.time())
+        )
+
+    rows = db.scalars(stmt.order_by(Task.due_date.is_(None), Task.due_date.asc(), Task.id.asc())).all()
+    today = local_today()
+
+    by_person: dict[int | None, list[Task]] = {}
+    for task in rows:
+        by_person.setdefault(task.assignee_id, []).append(task)
+
+    people: list[PersonTasksOut] = []
+    for assignee_id, tasks in by_person.items():
+        if assignee_id is None:
+            continue
+        assignee = db.get(User, assignee_id)
+        if assignee is None:
+            continue
+        open_tasks = [t for t in tasks if t.status != TaskStatus.completed.value]
+        people.append(
+            PersonTasksOut(
+                user=PersonRef(
+                    id=assignee.id,
+                    full_name=assignee.full_name,
+                    display_name=assignee.display_name,
+                    avatar_url=assignee.avatar_url,
+                    avatar_color=assignee.avatar_color,
+                    role=assignee.role,
+                ),
+                open_count=len(open_tasks),
+                overdue_count=sum(1 for t in open_tasks if is_overdue(t, utcnow())),
+                blocked_count=sum(1 for t in open_tasks if t.status == TaskStatus.blocked.value),
+                tracked_seconds=sum(tracked_seconds(db, t.id) for t in open_tasks),
+                tasks=[task_out(user, t, db) for t in tasks],
+            )
+        )
+
+    # Busiest first, but never let someone with no open work disappear.
+    people.sort(key=lambda p: (-p.open_count, p.user.full_name.lower()))
+
+    unassigned = by_person.get(None, [])
+    return TaskBoardOut(
+        people=people,
+        unassigned_count=len(unassigned),
+        unassigned=[task_out(user, t, db) for t in unassigned],
+    )
+
+
+@router.post("/{task_id}/remind", response_model=ReminderOut)
+def send_reminder(
+    task_id: int,
+    payload: RemindIn,
+    current: CurrentUser = Depends(get_current_user),
+):
+    """A manager nudges the person carrying the task.
+
+    This writes a `task.reminder_sent` audit event, which is what the
+    recipient's notification feed reads — so a reminder needs no separate
+    message store and can never claim something the history does not show.
+    """
+    from app.schemas import PersonRef, ReminderOut
+
+    with write_tx() as db:
+        task = _load_for_write(current, db, task_id)
+        if task.deleted_at is not None:
+            raise conflict("TASK_DELETED", "A deleted task cannot be reminded")
+        if not policy.can_view_all_tasks(current.user):
+            raise forbidden("LEAD_ONLY", "Only a CEO or team lead can send reminders")
+        if task.assignee_id is None:
+            raise unprocessable("NOT_ASSIGNED", "This task has nobody to remind")
+
+        assignee = db.get(User, task.assignee_id)
+        if assignee is None or not assignee.is_active:
+            raise unprocessable("INVALID_ASSIGNEE", "The assignee is not an active user")
+
+        now = utcnow()
+        message = payload.message.strip() if payload.message else None
+        audit.record(
+            db,
+            event_type=EventType.task_reminder_sent.value,
+            entity_type="task",
+            entity_id=task.id,
+            task_id=task.id,
+            actor=current.user,
+            summary=(
+                f"{current.user.full_name} reminded {assignee.full_name} about “{task.title}”"
+                + (f": {message}" if message else "")
+            ),
+            meta={"message": message, "assignee_id": assignee.id},
+            created_at=now,
+        )
+        return ReminderOut(
+            task_id=task.id,
+            assignee=PersonRef(
+                id=assignee.id,
+                full_name=assignee.full_name,
+                display_name=assignee.display_name,
+                avatar_url=assignee.avatar_url,
+                avatar_color=assignee.avatar_color,
+                role=assignee.role,
+            ),
+            sent_by=PersonRef(
+                id=current.user.id,
+                full_name=current.user.full_name,
+                display_name=current.user.display_name,
+                avatar_url=current.user.avatar_url,
+                avatar_color=current.user.avatar_color,
+                role=current.user.role,
+            ),
+            message=message,
+            sent_at=now,
+        )
+
+
+@router.get("/{task_id}/links", response_model=list[LinkOut])
+def task_links(
+    task_id: int,
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Links attached to this task, so evidence lives with the work."""
+    from app.models import ResourceLink
+    from app.serializers import link_out
+
+    task = _load_for_write(current, db, task_id)
+    rows = db.scalars(
+        select(ResourceLink)
+        .where(ResourceLink.task_id == task.id, ResourceLink.deleted_at.is_(None))
+        .order_by(ResourceLink.created_at.desc())
+    ).all()
+    return [link_out(current.user, link) for link in rows]
 
 
 @router.get("/{task_id}", response_model=TaskOut)
@@ -314,6 +499,8 @@ def change_status(
         task = _load_for_write(current, db, task_id)
         if task.deleted_at is not None:
             raise conflict("TASK_DELETED", "A deleted task cannot change status")
+        if not policy.can_change_status(user, task):
+            raise forbidden("STATUS_NOT_ALLOWED", "You may not change this task's status")
 
         now = utcnow()
         rule = workflow.resolve_transition(
@@ -411,7 +598,7 @@ def reassign(
     payload: ReassignIn,
     current: CurrentUser = Depends(get_current_user),
 ):
-    if not policy.is_lead(current.user):
+    if not policy.can_reassign(current.user):
         raise forbidden("LEAD_ONLY", "Only a team lead can reassign tasks")
     with write_tx() as db:
         task = _load_for_write(current, db, task_id)

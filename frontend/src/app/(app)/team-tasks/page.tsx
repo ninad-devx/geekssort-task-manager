@@ -1,23 +1,26 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
 
-import { PageHeader } from "@/components/app-shell";
+import { PageHeader, roleLabel } from "@/components/app-shell";
+import { Avatar, displayName } from "@/components/avatar";
 import { CreateTaskDialog, Pager } from "@/components/tasks/task-dialogs";
 import { TaskRow } from "@/components/tasks/task-ui";
 import { Button } from "@/components/ui/button";
-import { Card, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
-import { Input, Select } from "@/components/ui/form";
+import { Card, CardContent, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
+import { Badge, Input, Select } from "@/components/ui/form";
 import { api, ApiError, qs } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { formatDuration } from "@/lib/format";
 import {
   CATEGORY_LABELS,
   PRIORITY_LABELS,
   STATUS_LABELS,
   type DirectoryEntry,
+  type TaskBoard,
   type TaskList,
 } from "@/lib/types";
 
@@ -32,6 +35,8 @@ function TeamTasksInner() {
   const [page, setPage] = useState(1);
   const [createOpen, setCreateOpen] = useState(false);
   const [showDeleted, setShowDeleted] = useState(false);
+  const [view, setView] = useState<"board" | "list">("board");
+  const [openPerson, setOpenPerson] = useState<number | null>(null);
 
   const filters = {
     status: params.get("status") ?? "",
@@ -39,6 +44,8 @@ function TeamTasksInner() {
     assignee_id: params.get("assignee_id") ?? "",
     category: params.get("category") ?? "",
     overdue: params.get("overdue") ?? "",
+    completed_from: params.get("completed_from") ?? "",
+    completed_to: params.get("completed_to") ?? "",
     q: params.get("q") ?? "",
   };
 
@@ -56,6 +63,22 @@ function TeamTasksInner() {
       api<TaskList>(
         `/tasks${qs({ ...filters, page, page_size: PAGE_SIZE, include_deleted: showDeleted })}`,
       ),
+    enabled: view === "list",
+  });
+
+  const board = useQuery({
+    queryKey: ["tasks", "board", filters.status, filters.q, filters.completed_from, filters.completed_to],
+    queryFn: () =>
+      api<TaskBoard>(
+        `/tasks/board${qs({
+          status: filters.status,
+          q: filters.q,
+          completed_from: filters.completed_from,
+          completed_to: filters.completed_to,
+          include_completed: filters.completed_from || filters.completed_to ? true : undefined,
+        })}`,
+      ),
+    enabled: view === "board",
   });
 
   const directory = useQuery({
@@ -72,7 +95,9 @@ function TeamTasksInner() {
     );
   }
 
-  const invalidate = () => client.invalidateQueries({ queryKey: ["tasks"] });
+  const invalidate = () => {
+    void client.invalidateQueries({ queryKey: ["tasks"] });
+  };
   const today = new Date().toISOString().slice(0, 10);
   const total = tasks.data?.total ?? 0;
 
@@ -80,9 +105,12 @@ function TeamTasksInner() {
     <>
       <PageHeader
         title="Team Tasks"
-        description="Every task in the company, including deleted ones when you switch that on."
+        description="Every task in the company, grouped by the person carrying it."
         actions={
           <>
+            <Button variant="outline" onClick={() => setView(view === "board" ? "list" : "board")}>
+              {view === "board" ? "Flat list" : "By person"}
+            </Button>
             <Button variant="outline" onClick={() => setShowDeleted((v) => !v)}>
               {showDeleted ? "Hide deleted" : "Show deleted"}
             </Button>
@@ -146,12 +174,114 @@ function TeamTasksInner() {
         >
           Overdue only
         </Button>
+        {filters.completed_from || filters.completed_to ? (
+          <Badge variant="outline">
+            Completed {filters.completed_from || "…"} → {filters.completed_to || "…"}
+          </Badge>
+        ) : null}
         <Button variant="ghost" size="sm" onClick={() => router.replace("/team-tasks")}>
           Clear
         </Button>
       </div>
 
-      {tasks.isLoading ? (
+      {view === "board" ? (
+        board.isLoading ? (
+          <Spinner label="Loading the team board" />
+        ) : board.isError ? (
+          <ErrorState
+            message={
+              board.error instanceof ApiError ? board.error.message : "Could not load the team board."
+            }
+            onRetry={() => void board.refetch()}
+          />
+        ) : (board.data?.people.length ?? 0) === 0 && board.data?.unassigned_count === 0 ? (
+          <EmptyState
+            title="Nothing assigned right now"
+            description="When work is assigned it appears here, grouped by person."
+          />
+        ) : (
+          <div className="space-y-2">
+            {(board.data?.people ?? []).map((person) => {
+              const expanded = openPerson === person.user.id;
+              return (
+                <Card key={person.user.id}>
+                  <CardContent className="py-3">
+                    <button
+                      type="button"
+                      className="flex w-full flex-wrap items-center gap-3 text-left"
+                      onClick={() => setOpenPerson(expanded ? null : person.user.id)}
+                      aria-expanded={expanded}
+                    >
+                      <Avatar person={person.user} size="md" />
+                      <span className="flex min-w-0 flex-col">
+                        <span className="font-medium">{displayName(person.user)}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {roleLabel(person.user.role)}
+                        </span>
+                      </span>
+                      <span className="ml-auto flex flex-wrap items-center gap-2">
+                        {person.blocked_count > 0 ? (
+                          <Badge variant="warning">{person.blocked_count} blocked</Badge>
+                        ) : null}
+                        {person.overdue_count > 0 ? (
+                          <Badge variant="warning">{person.overdue_count} overdue</Badge>
+                        ) : null}
+                        <Badge variant="outline">
+                          {person.open_count} open
+                        </Badge>
+                        {person.tracked_seconds > 0 ? (
+                          <span className="tabular text-xs text-muted-foreground">
+                            {formatDuration(person.tracked_seconds)} tracked
+                          </span>
+                        ) : null}
+                        {expanded ? (
+                          <ChevronDown className="h-4 w-4" aria-hidden />
+                        ) : (
+                          <ChevronRight className="h-4 w-4" aria-hidden />
+                        )}
+                      </span>
+                    </button>
+
+                    {expanded ? (
+                      <ul className="mt-3 border-l-2 border-border pl-3">
+                        {person.tasks.map((task) => (
+                          <TaskRow
+                            key={task.id}
+                            task={task}
+                            today={today}
+                            onChanged={invalidate}
+                            canRemind
+                          />
+                        ))}
+                      </ul>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              );
+            })}
+
+            {board.data && board.data.unassigned_count > 0 ? (
+              <Card className="border-dashed">
+                <CardContent className="py-3">
+                  <p className="text-sm font-medium">
+                    Unassigned · {board.data.unassigned_count}
+                  </p>
+                  <ul className="mt-2">
+                    {board.data.unassigned.map((task) => (
+                      <TaskRow
+                        key={task.id}
+                        task={task}
+                        today={today}
+                        onChanged={invalidate}
+                      />
+                    ))}
+                  </ul>
+                </CardContent>
+              </Card>
+            ) : null}
+          </div>
+        )
+      ) : tasks.isLoading ? (
         <Spinner label="Loading team tasks" />
       ) : tasks.isError ? (
         <ErrorState
@@ -175,7 +305,13 @@ function TeamTasksInner() {
           <Card>
             <ul>
               {(tasks.data?.items ?? []).map((task) => (
-                <TaskRow key={task.id} task={task} today={today} onChanged={invalidate} />
+                <TaskRow
+                  key={task.id}
+                  task={task}
+                  today={today}
+                  onChanged={invalidate}
+                  canRemind
+                />
               ))}
             </ul>
           </Card>

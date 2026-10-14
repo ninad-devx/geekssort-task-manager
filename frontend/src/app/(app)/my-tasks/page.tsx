@@ -30,7 +30,7 @@ export default function MyTasksPage() {
   const tasks = useQuery({
     queryKey: ["tasks", "mine", page, status, priority, query],
     queryFn: () =>
-      api<TaskList>(`/tasks${qs({ page, page_size: PAGE_SIZE, status, priority, q: query })}`),
+      api<TaskList>(`/tasks${qs({ mine: 1, page, page_size: PAGE_SIZE, status, priority, q: query })}`),
   });
 
   const invalidate = () => client.invalidateQueries({ queryKey: ["tasks"] });
@@ -53,7 +53,7 @@ export default function MyTasksPage() {
     <>
       <PageHeader
         title="My Tasks"
-        description="Everything assigned to you, plus anything you created for yourself."
+        description="Work assigned to you, plus anything you raised for yourself. Work you passed to someone else lives in Team Tasks."
         actions={
           capabilities?.can_create_tasks ? (
             <Button onClick={() => setCreateOpen(true)}>

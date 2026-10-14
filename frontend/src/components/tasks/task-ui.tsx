@@ -1,12 +1,12 @@
 "use client";
 
-import { Play, Square } from "lucide-react";
+import { Bell, Play, Square } from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
-import { Badge, Progress } from "@/components/ui/form";
+import { Badge, Input, Progress } from "@/components/ui/form";
 import { api, ApiError } from "@/lib/api";
 import { formatDuration } from "@/lib/format";
 import { PRIORITY_LABELS, STATUS_LABELS, type Priority, type Task, type TaskStatus } from "@/lib/types";
@@ -73,10 +73,17 @@ export function TimerActions({
     }
   };
 
+  const runningLogId = task.running?.log_id;
+
   const pause = async () => {
     setBusy(true);
     try {
-      await api("/timer/pause", { method: "POST", json: {} });
+      // Timers are concurrent, so pause this task's timer by id rather than
+      // whichever one happens to be "current".
+      await api("/timer/pause", {
+        method: "POST",
+        json: runningLogId ? { log_id: runningLogId } : {},
+      });
       toast.success("Timer paused");
       onChanged();
     } catch (error) {
@@ -94,14 +101,6 @@ export function TimerActions({
       </Button>
     );
   }
-  if (actions.includes("switch_timer")) {
-    return (
-      <Button size={size} variant="outline" onClick={start} loading={busy}>
-        <Play className="h-4 w-4" aria-hidden />
-        Switch here
-      </Button>
-    );
-  }
   if (actions.includes("start_timer")) {
     const resumed = task.tracked_seconds > 0;
     return (
@@ -114,8 +113,46 @@ export function TimerActions({
   return null;
 }
 
-export function TaskRow({ task, today, onChanged }: { task: Task; today: string; onChanged: () => void }) {
+export function TaskRow({
+  task,
+  today,
+  onChanged,
+  canRemind,
+}: {
+  task: Task;
+  today: string;
+  onChanged: () => void;
+  canRemind?: boolean;
+}) {
   const late = daysOverdue(task.due_date, today);
+  const [reminding, setReminding] = useState(false);
+  const [remindOpen, setRemindOpen] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const remind = async (text: string) => {
+    setReminding(true);
+    try {
+      await api(`/tasks/${task.id}/remind`, {
+        method: "POST",
+        json: { message: text.trim() || null },
+      });
+      toast.success(
+        task.assignee
+          ? `Reminder sent to ${task.assignee.full_name}`
+          : "Reminder sent",
+      );
+      setRemindOpen(false);
+      setMessage("");
+      onChanged();
+    } catch (error) {
+      toast.error(
+        error instanceof ApiError ? error.message : "Could not send the reminder",
+      );
+    } finally {
+      setReminding(false);
+    }
+  };
+
   return (
     <li className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
       <div className="min-w-0 flex-1">
@@ -143,8 +180,39 @@ export function TaskRow({ task, today, onChanged }: { task: Task; today: string;
             <Progress value={task.progress_percent} />
           </div>
         ) : null}
+        {remindOpen ? (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <Input
+              className="h-8 max-w-xs"
+              placeholder="Reminder (optional)"
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+            />
+            <Button
+              size="sm"
+              loading={reminding}
+              onClick={() => void remind(message)}
+            >
+              Send
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setRemindOpen(false)}>
+              Cancel
+            </Button>
+          </div>
+        ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">
+        {canRemind && !task.deleted_at ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setRemindOpen((v) => !v)}
+            title={task.assignee ? `Remind ${task.assignee.full_name}` : "No assignee yet"}
+          >
+            <Bell className="h-4 w-4" aria-hidden />
+            <span className="sr-only">Remind</span>
+          </Button>
+        ) : null}
         <TimerActions task={task} onChanged={onChanged} />
       </div>
     </li>

@@ -6,6 +6,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/app-shell";
+import { Avatar, displayName } from "@/components/avatar";
 import { Button } from "@/components/ui/button";
 import { Card, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
 import {
@@ -19,7 +20,7 @@ import {
 } from "@/components/ui/form";
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { formatDateTime } from "@/lib/format";
+import { formatDateTime, formatReadable } from "@/lib/format";
 import type { Folder, ResourceLink } from "@/lib/types";
 
 interface SearchResult {
@@ -379,6 +380,16 @@ function LinkCard({
       </div>
       {link.description ? (
         <p className="mt-1.5 line-clamp-2 text-sm text-muted-foreground">{link.description}</p>
+      ) : null}
+      {link.created_by ? (
+        <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <Avatar person={link.created_by} size="xs" />
+          <span className="truncate">Added by {displayName(link.created_by)}</span>
+          <span aria-hidden>·</span>
+          <time dateTime={link.created_at} className="whitespace-nowrap">
+            {formatReadable(link.created_at)}
+          </time>
+        </div>
       ) : null}
       {link.tags.length > 0 ? (
         <div className="mt-2 flex flex-wrap gap-1">

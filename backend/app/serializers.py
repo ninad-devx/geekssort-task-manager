@@ -24,6 +24,7 @@ from app.schemas import (
     FolderOut,
     LinkOut,
     LogOut,
+    PersonRef,
     RunningTimer,
     TaskActor,
     TaskOut)
@@ -77,10 +78,34 @@ def running_session_for_task(db: Session, task_id: int) -> WorkSession | None:
     )
 
 
+def running_sessions_for_user(db: Session, user_id: int) -> list[WorkSession]:
+    """Every timer this person has open right now. Timers are concurrent."""
+    return list(
+        db.scalars(
+            select(WorkSession)
+            .where(
+                WorkSession.user_id == user_id,
+                WorkSession.ended_at.is_(None),
+                WorkSession.deleted_at.is_(None),
+            )
+            .order_by(WorkSession.started_at.asc(), WorkSession.id.asc())
+        ).all()
+    )
+
+
 def running_session_for_user(db: Session, user_id: int) -> WorkSession | None:
+    """The most recently opened running timer, or None."""
+    sessions = running_sessions_for_user(db, user_id)
+    return sessions[-1] if sessions else None
+
+
+def running_session_for_user_task(
+    db: Session, user_id: int, task_id: int
+) -> WorkSession | None:
     return db.scalar(
         select(WorkSession).where(
             WorkSession.user_id == user_id,
+            WorkSession.task_id == task_id,
             WorkSession.ended_at.is_(None),
             WorkSession.deleted_at.is_(None),
         )
@@ -120,17 +145,16 @@ def task_allowed_actions(user: User, task: Task, db: Session, now=None) -> list[
         actions.append("change_status")
     if policy.can_delete_task(user, task):
         actions.append("delete")
-    if policy.is_lead(user):
+    if policy.can_reassign(user):
         actions.append("reassign")
 
     if policy.can_track_time(user, task):
-        own_running = running_session_for_user(db, user.id)
+        own_running = running_session_for_user_task(db, user.id, task.id)
         if own_running is not None:
-            if own_running.task_id == task.id:
-                actions.append("pause_timer")
-            else:
-                actions.append("switch_timer")
+            actions.append("pause_timer")
         elif task.status != TaskStatus.completed.value:
+            # Starting here while other timers run is allowed: a person can
+            # genuinely be working on two things at once.
             actions.append("start_timer")
         actions.append("add_time")
         actions.append("add_note")
@@ -228,6 +252,10 @@ def log_out(user: User, log: WorkSession, db: Session) -> LogOut:
 
 
 def audit_out(event: AuditEvent) -> AuditEventOut:
+    # entity_id is an INTEGER column and every audited entity has a numeric id.
+    # If a row ever holds something else, show it as an unusable reference rather
+    # than raising: one bad row must not blank the whole activity feed.
+    entity_id = event.entity_id if isinstance(event.entity_id, int) else None
     return AuditEventOut(
         id=event.id,
         request_id=event.request_id,
@@ -235,7 +263,7 @@ def audit_out(event: AuditEvent) -> AuditEventOut:
         actor_id=event.actor_id,
         actor_name=event.actor_name,
         entity_type=event.entity_type,
-        entity_id=event.entity_id,
+        entity_id=entity_id,
         task_id=event.task_id,
         summary=event.summary,
         before=_json(event.before_json),
@@ -258,11 +286,24 @@ def link_out(user: User, link: ResourceLink) -> LinkOut:
         folder_id=link.folder_id,
         folder_name=link.folder.name if link.folder else None,
         folder_visibility=link.folder.visibility if link.folder else None,
+        task_id=link.task_id,
         title=link.title,
         url=link.url,
         description=link.description,
         tags=[t.tag for t in tags],
         created_by_id=link.created_by_id,
+        created_by=(
+            PersonRef(
+                id=link.creator.id,
+                full_name=link.creator.full_name,
+                display_name=link.creator.display_name,
+                avatar_url=link.creator.avatar_url,
+                avatar_color=link.creator.avatar_color,
+                role=link.creator.role,
+            )
+            if link.creator
+            else None
+        ),
         created_at=link.created_at,
         updated_at=link.updated_at,
         allowed_actions=actions,

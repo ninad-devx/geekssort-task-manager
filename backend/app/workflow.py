@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from app.errors import conflict
-from app.models import EventType, Role, TaskStatus as S, User
+from app.models import EventType, TaskStatus as S, User
 
 T = S
 
@@ -78,6 +78,14 @@ def resolve_transition(
     note: str | None = None,
     reason: str | None = None,
 ) -> Transition:
+    """Validate a status change.
+
+    Whether this person may change this task at all is decided by
+    `policy.can_change_status` before this is called — this function owns the
+    state machine (SRS 10.2) and the extra conditions on individual transitions,
+    and must never re-derive authority from `user.role`.
+    """
+    from app import policy
     from app.errors import forbidden
 
     key = (task_status, to_status)
@@ -91,29 +99,20 @@ def resolve_transition(
     rule = TRANSITIONS[key]
 
     reviewer = is_reviewer(user)
-    lead = user.role == Role.team_lead.value
-    ceo = user.role == Role.ceo.value
+    lead = policy.is_lead(user)
 
-    # CEO: read-only oversight; may only use the two review transitions (and only with can_review)
-    if ceo:
-        allowed = (task_status, to_status) in (
-            (S.in_review.value, S.completed.value),
-            (S.in_review.value, S.in_progress.value),
+    # 10.2: withdrawing a submission is the assignee's own move, unless the
+    # reviewer is the one sending it back for revision.
+    if not reviewer and (task_status, to_status) == (S.in_review.value, S.in_progress.value):
+        if not is_assignee:
+            raise forbidden("STATUS_NOT_ALLOWED", "Only the assignee may withdraw a submission")
+
+    # 10.2: work that was flagged for review is completed by a reviewer or a lead.
+    if to_status == S.completed.value and requires_review and not (reviewer or lead):
+        raise forbidden(
+            "REVIEW_REQUIRED",
+            "This task requires review; ask a reviewer to approve it",
         )
-        if not allowed or not reviewer:
-            raise forbidden("STATUS_NOT_ALLOWED", "A CEO may only approve work or request a revision")
-
-    if not ceo:
-        if not (lead or is_assignee):
-            raise forbidden("STATUS_NOT_ALLOWED", "Only the assignee or a team lead may change this task")
-        if not lead and to_status == S.completed.value and requires_review:
-            raise forbidden(
-                "REVIEW_REQUIRED",
-                "This task requires review; ask a reviewer to approve it",
-            )
-        if not reviewer and (task_status, to_status) == (S.in_review.value, S.in_progress.value):
-            if not is_assignee:
-                raise forbidden("STATUS_NOT_ALLOWED", "Only the assignee may withdraw a submission")
 
     if rule.requires_reason and (reason is None or len(reason.strip()) < 3):
         raise conflict("REASON_REQUIRED", "A reason of at least 3 characters is required")

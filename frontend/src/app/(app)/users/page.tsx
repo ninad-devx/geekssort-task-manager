@@ -303,6 +303,22 @@ function CreateUserDialog({
   const [canReview, setCanReview] = useState(false);
   const [password, setPassword] = useState("");
 
+  // This dialog stays mounted between opens, so every field must be cleared on
+  // the way out. Otherwise dismissing it with the admin flag ticked silently
+  // makes the next user created an admin.
+  const clearForm = () => {
+    setEmail("");
+    setFullName("");
+    setRole("member");
+    setIsAdmin(false);
+    setCanReview(false);
+    setPassword("");
+  };
+  const handleClose = () => {
+    clearForm();
+    onClose();
+  };
+
   const mutation = useMutation({
     mutationFn: () =>
       api<CreatedUser>("/users", {
@@ -318,11 +334,7 @@ function CreateUserDialog({
       }),
     onSuccess: async (created) => {
       toast.success(`Created ${created.full_name}`);
-      setEmail("");
-      setFullName("");
-      setPassword("");
-      setIsAdmin(false);
-      setCanReview(false);
+      clearForm();
       onClose();
       onIssued(created.full_name, created.temporary_password);
       await onDone();
@@ -334,12 +346,12 @@ function CreateUserDialog({
   return (
     <Dialog
       open={open}
-      onClose={onClose}
+      onClose={handleClose}
       title="Create a user"
       description="Leave the password blank to generate a temporary one, shown once."
       footer={
         <>
-          <Button variant="outline" onClick={onClose}>
+          <Button variant="outline" onClick={handleClose}>
             Cancel
           </Button>
           <Button
