@@ -16,3 +16,4 @@ node_modules/
 out/
 *.tsbuildinfo
 next-env.d.ts
+src/lib/api.generated.d.ts
