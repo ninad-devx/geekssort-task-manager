@@ -6,7 +6,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Dialog, Field, Input, Select } from "@/components/ui/form";
-import { api, ApiError } from "@/lib/api";
+import { api, errorMessage } from "@/lib/api";
 import {
   CATEGORY_LABELS,
   PRIORITY_LABELS,
@@ -27,6 +27,9 @@ export function Pager({
 }) {
   const pages = Math.max(1, Math.ceil(total / pageSize));
   if (pages <= 1) return null;
+  // Page numbers past the end render an empty list with no explanation, because
+  // the parent only clamped on some pages. Callers clamp; this is the backstop.
+  if (page > pages) return null;
   return (
     <div className="mt-4 flex items-center justify-between text-sm">
       <span className="text-muted-foreground">
@@ -66,6 +69,7 @@ export function CreateTaskDialog({
   const [dueDate, setDueDate] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
   const [requiresReview, setRequiresReview] = useState(false);
+  const [touched, setTouched] = useState(false);
 
   const directory = useQuery({
     queryKey: ["directory"],
@@ -93,36 +97,46 @@ export function CreateTaskDialog({
       onClose();
       await onDone();
     },
-    onError: (error) =>
-      toast.error(error instanceof ApiError ? error.message : "Could not create the task"),
+    onError: (error) => toast.error(errorMessage(error)),
   });
 
+  // Every field. The old version cleared only title, description, due date and
+  // category, so a task created for Alice with review required and a non-default
+  // priority silently pre-filled the *next* one the same way with no indication.
   const reset = () => {
     setTitle("");
     setDescription("");
     setDueDate("");
     setCategory("");
+    setPriority("medium");
+    setAssigneeId("");
+    setRequiresReview(false);
+    setTouched(false);
   };
+
+  const showTitleError = touched && title.trim().length === 0;
 
   return (
     <Dialog
       open={open}
       onClose={onClose}
       title="Create a task"
-      footer={
-        <>
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button onClick={() => mutation.mutate()} loading={mutation.isPending} disabled={!title.trim()}>
-            Create
-          </Button>
-        </>
-      }
+      onSubmit={() => {
+        setTouched(true);
+        if (title.trim()) mutation.mutate();
+      }}
+      submitLabel="Create"
+      submitting={mutation.isPending}
     >
       <div className="flex flex-col gap-4">
-        <Field label="Title">
-          <Input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={200} />
+        <Field label="Title" required error={showTitleError ? "Give the task a title" : undefined}>
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            maxLength={200}
+            required
+            placeholder="What needs doing?"
+          />
         </Field>
         <Field label="Description" hint="Optional">
           <Input
@@ -151,7 +165,7 @@ export function CreateTaskDialog({
               ))}
             </Select>
           </Field>
-          <Field label="Due date">
+          <Field label="Due date" hint="Optional">
             <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
           </Field>
           {showAssignee ? (

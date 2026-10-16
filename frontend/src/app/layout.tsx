@@ -8,8 +8,13 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
-  title: "MarketingOS",
-  description: "Marketing operations and work tracking",
+  title: "Taskssort",
+  description: "Task management and operations workspace",
+  icons: {
+    icon: "/logo.png",
+    shortcut: "/logo.png",
+    apple: "/logo.png",
+  },
 };
 
 export const viewport: Viewport = {

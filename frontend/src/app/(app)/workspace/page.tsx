@@ -1,7 +1,21 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, FolderPlus, Link2, Pencil, Plus, Search, Trash2 } from "lucide-react";
+import {
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  Globe,
+  Link2,
+  Lock,
+  Pencil,
+  Plus,
+  Search,
+  Sparkles,
+  Tag,
+  Trash2,
+  ArrowUpRight,
+} from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -21,11 +35,12 @@ import {
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatDateTime, formatReadable } from "@/lib/format";
-import type { Folder, ResourceLink } from "@/lib/types";
+import type { Folder as FolderType, ResourceLink } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 interface SearchResult {
   query: string;
-  folders: Folder[];
+  folders: FolderType[];
   links: ResourceLink[];
 }
 
@@ -35,14 +50,14 @@ export default function WorkspacePage() {
   const [selected, setSelected] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [dialog, setDialog] = useState<null | "folder" | "link">(null);
-  const [editingFolder, setEditingFolder] = useState<Folder | null>(null);
+  const [editingFolder, setEditingFolder] = useState<FolderType | null>(null);
   const [editingLink, setEditingLink] = useState<ResourceLink | null>(null);
-  const [deletingFolder, setDeletingFolder] = useState<Folder | null>(null);
+  const [deletingFolder, setDeletingFolder] = useState<FolderType | null>(null);
   const [deletingLink, setDeletingLink] = useState<ResourceLink | null>(null);
 
   const folders = useQuery({
     queryKey: ["workspace", "folders"],
-    queryFn: () => api<Folder[]>("/workspace/folders"),
+    queryFn: () => api<FolderType[]>("/workspace/folders"),
   });
 
   const links = useQuery({
@@ -59,7 +74,7 @@ export default function WorkspacePage() {
   const invalidate = () => client.invalidateQueries({ queryKey: ["workspace"] });
 
   const deleteFolder = useMutation({
-    mutationFn: (folder: Folder) => api(`/workspace/folders/${folder.id}`, { method: "DELETE" }),
+    mutationFn: (folder: FolderType) => api(`/workspace/folders/${folder.id}`, { method: "DELETE" }),
     onSuccess: async () => {
       toast.success("Folder deleted");
       setDeletingFolder(null);
@@ -85,114 +100,228 @@ export default function WorkspacePage() {
     },
   });
 
-  const tree = buildTree(folders.data ?? []);
+  const allFolders = folders.data ?? [];
+  const currentLinks = links.data ?? [];
+  const tree = buildTree(allFolders);
   const showSearch = query.trim().length >= 2;
+  const totalFolderLinks = allFolders.reduce((sum, f) => sum + f.link_count, 0);
+  const uniqueTags = new Set(currentLinks.flatMap((l) => l.tags)).size;
+  const selectedFolder = allFolders.find((f) => f.id === selected) ?? null;
 
   return (
     <>
       <PageHeader
         title="Marketing Workspace"
-        description="Folders of links — research, brand references, past campaigns."
+        description="Curated folders of reference links — research, brand assets, competitor intelligence, and past campaigns."
         actions={
           <>
             {capabilities?.can_create_folders ? (
               <Button variant="outline" onClick={() => setDialog("folder")}>
                 <FolderPlus className="h-4 w-4" aria-hidden />
-                New folder
+                New Folder
               </Button>
             ) : null}
             {capabilities?.can_add_links ? (
               <Button onClick={() => setDialog("link")}>
                 <Plus className="h-4 w-4" aria-hidden />
-                Add link
+                Add Link
               </Button>
             ) : null}
           </>
         }
       />
 
-      <div className="relative mb-4 max-w-sm">
-        <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-        <Input
-          className="pl-8"
-          placeholder="Search folders, links, tags…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
+      {/* Workspace Summary KPI Strip */}
+      <div className="mb-5 grid gap-4 sm:grid-cols-3">
+        <div className="flex items-center justify-between rounded-2xl p-5 hero-green-card shadow-[0_8px_24px_rgba(20,83,56,0.18)]">
+          <div>
+            <p className="text-xs font-medium text-white/85">Active View</p>
+            <p className="mt-1 truncate text-xl font-bold text-white">
+              {selectedFolder ? selectedFolder.name : "All Workspace Links"}
+            </p>
+            <p className="mt-1 text-xs text-[#a9dfc2]">
+              {currentLinks.length} resource{currentLinks.length === 1 ? "" : "s"} in current view
+            </p>
+          </div>
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white/15 text-white">
+            <Link2 className="h-5 w-5" aria-hidden />
+          </span>
+        </div>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Workspace Folders</p>
+            <p className="mt-1 tabular text-3xl font-bold tracking-tight text-foreground">
+              {allFolders.length}
+            </p>
+            <p className="mt-1 text-xs text-[#1f7a52]">
+              {totalFolderLinks} categorized link{totalFolderLinks === 1 ? "" : "s"}
+            </p>
+          </div>
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <FolderOpen className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Active Tags in View</p>
+            <p className="mt-1 tabular text-3xl font-bold tracking-tight text-foreground">
+              {uniqueTags}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Searchable by title, folder, or tag
+            </p>
+          </div>
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <Tag className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
       </div>
+
+      {/* Search Bar */}
+      <Card className="mb-5 p-3">
+        <div className="relative flex items-center">
+          <Search
+            className="pointer-events-none absolute left-3.5 h-4 w-4 text-muted-foreground"
+            aria-hidden
+          />
+          <Input
+            className="h-10 rounded-full border-border/60 bg-[#f7f8f9] pl-10 pr-4"
+            placeholder="Search folders, links, descriptions, or tags…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          {query ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-2"
+              onClick={() => setQuery("")}
+            >
+              Clear
+            </Button>
+          ) : null}
+        </div>
+      </Card>
 
       {showSearch ? (
         <SearchResults
           result={search.data}
           isLoading={search.isLoading}
-          onEditLink={setEditingLink}
+          onSelectFolder={(id) => {
+            setSelected(id);
+            setQuery("");
+          }}
+          onEditLink={(link) => {
+            setEditingLink(link);
+            setDialog("link");
+          }}
           onDeleteLink={setDeletingLink}
         />
       ) : (
-        <div className="grid gap-5 lg:grid-cols-[280px_1fr]">
-          <Card className="h-fit">
-            <div className="border-b border-border p-3">
+        <div className="grid gap-5 lg:grid-cols-[300px_1fr]">
+          {/* Left Folder Explorer Card */}
+          <Card className="h-fit overflow-hidden">
+            <div className="flex items-center justify-between border-b border-border/70 bg-muted/30 px-4 py-3.5">
+              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Folders
+              </span>
+              {capabilities?.can_create_folders ? (
+                <button
+                  type="button"
+                  onClick={() => setDialog("folder")}
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-[#145338] hover:underline"
+                >
+                  <Plus className="h-3.5 w-3.5" aria-hidden />
+                  New
+                </button>
+              ) : null}
+            </div>
+
+            <div className="p-2.5">
               <button
                 type="button"
                 onClick={() => setSelected(null)}
-                className={`w-full rounded-md px-2 py-1.5 text-left text-sm ${
-                  selected === null ? "bg-primary/10 font-medium text-primary" : "hover:bg-secondary"
-                }`}
+                className={cn(
+                  "flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-left text-sm transition-all",
+                  selected === null
+                    ? "bg-[#eaf4ef] font-semibold text-[#145338]"
+                    : "font-medium text-muted-foreground hover:bg-muted/70 hover:text-foreground",
+                )}
               >
-                All folders
+                <Sparkles className="h-4 w-4 shrink-0" aria-hidden />
+                <span className="flex-1 truncate">All Folders</span>
               </button>
-            </div>
-            {folders.isLoading ? (
-              <Spinner />
-            ) : folders.isError ? (
-              <div className="p-3">
-                <ErrorState
-                  message="Could not load folders."
-                  onRetry={() => void folders.refetch()}
-                />
-              </div>
-            ) : tree.length === 0 ? (
-              <p className="p-4 text-sm text-muted-foreground">
-                No folders yet. Run <code>python -m app.cli seed-defaults</code> to create the
-                standard set.
-              </p>
-            ) : (
-              <ul className="p-2">
-                {tree.map((node) => (
-                  <FolderNode
-                    key={node.folder.id}
-                    node={node}
-                    depth={0}
-                    selected={selected}
-                    onSelect={setSelected}
+
+              {folders.isLoading ? (
+                <Spinner />
+              ) : folders.isError ? (
+                <div className="p-3">
+                  <ErrorState
+                    message="Could not load folders."
+                    onRetry={() => void folders.refetch()}
                   />
-                ))}
-              </ul>
-            )}
+                </div>
+              ) : tree.length === 0 ? (
+                <p className="p-4 text-xs leading-relaxed text-muted-foreground">
+                  No folders yet. Run <code>python -m app.cli seed-defaults</code> to create the
+                  standard set.
+                </p>
+              ) : (
+                <ul className="mt-1.5 space-y-0.5">
+                  {tree.map((node) => (
+                    <FolderNode
+                      key={node.folder.id}
+                      node={node}
+                      depth={0}
+                      selected={selected}
+                      onSelect={setSelected}
+                    />
+                  ))}
+                </ul>
+              )}
+            </div>
           </Card>
 
-          <div>
-            {selected !== null ? (
+          {/* Right Links Content Area */}
+          <div className="flex flex-col gap-4">
+            {selectedFolder ? (
               <FolderToolbar
-                folder={(folders.data ?? []).find((f) => f.id === selected) ?? null}
-                onEdit={setEditingFolder}
+                folder={selectedFolder}
+                onEdit={(folder) => {
+                  setEditingFolder(folder);
+                  setDialog("folder");
+                }}
                 onDelete={setDeletingFolder}
               />
             ) : null}
+
             {links.isLoading ? (
               <Spinner label="Loading links" />
-            ) : (links.data ?? []).length === 0 ? (
+            ) : currentLinks.length === 0 ? (
               <EmptyState
                 title="No links here yet"
                 description="Add a reference link so the whole team can find it again."
+                action={
+                  capabilities?.can_add_links ? (
+                    <Button className="mt-2" onClick={() => setDialog("link")}>
+                      <Plus className="h-4 w-4" aria-hidden />
+                      Add first link
+                    </Button>
+                  ) : null
+                }
               />
             ) : (
-              <div className="grid gap-3 sm:grid-cols-2">
-                {(links.data ?? []).map((link) => (
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                {currentLinks.map((link) => (
                   <LinkCard
                     key={link.id}
                     link={link}
-                    onEdit={() => setEditingLink(link)}
+                    onEdit={() => {
+                      setEditingLink(link);
+                      setDialog("link");
+                    }}
                     onDelete={() => setDeletingLink(link)}
                   />
                 ))}
@@ -206,7 +335,7 @@ export default function WorkspacePage() {
         <FolderDialog
           open
           folder={editingFolder}
-          folders={folders.data ?? []}
+          folders={allFolders}
           onClose={() => {
             setDialog(null);
             setEditingFolder(null);
@@ -218,7 +347,7 @@ export default function WorkspacePage() {
         <LinkDialog
           open
           link={editingLink}
-          folders={folders.data ?? []}
+          folders={allFolders}
           defaultFolderId={selected}
           onClose={() => {
             setDialog(null);
@@ -252,12 +381,12 @@ export default function WorkspacePage() {
 }
 
 interface FolderNodeData {
-  folder: Folder;
+  folder: FolderType;
   children: FolderNodeData[];
 }
 
-function buildTree(folders: Folder[]): FolderNodeData[] {
-  const byParent = new Map<number | null, Folder[]>();
+function buildTree(folders: FolderType[]): FolderNodeData[] {
+  const byParent = new Map<number | null, FolderType[]>();
   for (const folder of folders) {
     const list = byParent.get(folder.parent_id) ?? [];
     list.push(folder);
@@ -282,38 +411,69 @@ function FolderNode({
   onSelect: (id: number) => void;
 }) {
   const [open, setOpen] = useState(depth === 0);
+  const isSelected = selected === node.folder.id;
+
   return (
     <li>
       <div
-        className={`flex items-center gap-1 rounded-md pr-2 ${
-          selected === node.folder.id ? "bg-primary/10" : "hover:bg-secondary"
-        }`}
+        className={cn(
+          "flex items-center gap-1.5 rounded-xl pr-2.5 transition-colors",
+          isSelected
+            ? "bg-[#eaf4ef] text-[#145338]"
+            : "text-muted-foreground hover:bg-muted/70 hover:text-foreground",
+        )}
         style={{ paddingLeft: `${depth * 12 + 8}px` }}
       >
         <button
           type="button"
           onClick={() => setOpen((v) => !v)}
-          className="px-1 py-1.5 text-xs text-muted-foreground"
+          className="px-1 py-2 text-xs text-muted-foreground"
           aria-label={open ? "Collapse" : "Expand"}
         >
           {node.children.length > 0 ? (open ? "▾" : "▸") : "·"}
         </button>
+        {isSelected ? (
+          <FolderOpen className="h-4 w-4 shrink-0 text-[#145338]" aria-hidden />
+        ) : (
+          <Folder className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+        )}
         <button
           type="button"
           onClick={() => onSelect(node.folder.id)}
-          className={`min-w-0 flex-1 truncate py-1.5 text-left text-sm ${
-            selected === node.folder.id ? "font-medium text-primary" : ""
-          }`}
+          className={cn(
+            "min-w-0 flex-1 truncate py-2 text-left text-sm",
+            isSelected ? "font-semibold text-[#145338]" : "font-medium",
+          )}
         >
           {node.folder.name}
         </button>
-        {node.folder.visibility === "management" ? <Badge variant="warning">Lead</Badge> : null}
-        <span className="text-xs text-muted-foreground">{node.folder.link_count}</span>
+        {node.folder.visibility === "management" ? (
+          <Badge variant="warning" title="Management only">
+            <Lock className="h-2.5 w-2.5" aria-hidden />
+            Lead
+          </Badge>
+        ) : null}
+        <span
+          className={cn(
+            "rounded-md px-1.5 py-0.5 text-[11px] font-semibold tabular",
+            isSelected
+              ? "bg-[#145338] text-white"
+              : "bg-muted text-muted-foreground",
+          )}
+        >
+          {node.folder.link_count}
+        </span>
       </div>
       {open && node.children.length > 0 ? (
-        <ul>
+        <ul className="mt-0.5 space-y-0.5">
           {node.children.map((child) => (
-            <FolderNode key={child.folder.id} node={child} depth={depth + 1} selected={selected} onSelect={onSelect} />
+            <FolderNode
+              key={child.folder.id}
+              node={child}
+              depth={depth + 1}
+              selected={selected}
+              onSelect={onSelect}
+            />
           ))}
         </ul>
       ) : null}
@@ -326,33 +486,55 @@ function FolderToolbar({
   onEdit,
   onDelete,
 }: {
-  folder: Folder | null;
-  onEdit: (folder: Folder) => void;
-  onDelete: (folder: Folder) => void;
+  folder: FolderType | null;
+  onEdit: (folder: FolderType) => void;
+  onDelete: (folder: FolderType) => void;
 }) {
   if (!folder) return null;
   return (
-    <div className="mb-3 flex flex-wrap items-center gap-2">
-      <h2 className="text-sm font-semibold">{folder.name}</h2>
-      <Badge variant="outline">{folder.link_count} links</Badge>
-      {folder.visibility === "management" ? <Badge variant="warning">Management only</Badge> : null}
-      <span className="text-xs text-muted-foreground">
-        Created {formatDateTime(folder.created_at)}
-      </span>
-      {folder.allowed_actions.includes("edit") ? (
-        <Button variant="ghost" size="sm" className="ml-auto" onClick={() => onEdit(folder)}>
-          <Pencil className="h-4 w-4" aria-hidden />
-          Rename
-        </Button>
-      ) : null}
-      {folder.allowed_actions.includes("delete") ? (
-        <Button variant="ghost" size="sm" onClick={() => onDelete(folder)}>
-          <Trash2 className="h-4 w-4" aria-hidden />
-          Delete
-        </Button>
-      ) : null}
-    </div>
+    <Card className="p-4">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#eaf4ef] text-[#145338]">
+          <FolderOpen className="h-4 w-4" aria-hidden />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-base font-bold text-foreground">{folder.name}</h2>
+            <Badge variant="default">{folder.link_count} links</Badge>
+            {folder.visibility === "management" ? (
+              <Badge variant="warning">Management only</Badge>
+            ) : null}
+          </div>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {folder.description ? `${folder.description} · ` : ""}
+            Created {formatDateTime(folder.created_at)}
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5">
+          {folder.allowed_actions.includes("edit") ? (
+            <Button variant="outline" size="sm" onClick={() => onEdit(folder)}>
+              <Pencil className="h-3.5 w-3.5" aria-hidden />
+              Rename
+            </Button>
+          ) : null}
+          {folder.allowed_actions.includes("delete") ? (
+            <Button variant="ghost" size="sm" onClick={() => onDelete(folder)}>
+              <Trash2 className="h-3.5 w-3.5" aria-hidden />
+              Delete
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    </Card>
   );
+}
+
+function getHostname(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
 }
 
 function LinkCard({
@@ -364,58 +546,90 @@ function LinkCard({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const host = getHostname(link.url);
+
   return (
-    <Card className="flex flex-col p-4">
-      <div className="flex items-start justify-between gap-2">
-        <a
-          href={link.url}
-          target="_blank"
-          rel="noopener noreferrer nofollow"
-          className="inline-flex items-center gap-1 font-medium hover:underline"
-        >
-          <Link2 className="h-4 w-4 shrink-0" aria-hidden />
-          <span className="break-all">{link.title}</span>
-          <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
-        </a>
+    <Card className="group flex flex-col justify-between p-5 transition-all duration-200 hover:-translate-y-0.5 hover:border-[#145338]/40">
+      <div>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#eaf4ef] text-[#145338]">
+              <Globe className="h-4 w-4" aria-hidden />
+            </span>
+            <div className="min-w-0">
+              <a
+                href={link.url}
+                target="_blank"
+                rel="noopener noreferrer nofollow"
+                className="block truncate text-sm font-bold text-foreground group-hover:text-[#145338] hover:underline"
+              >
+                {link.title}
+              </a>
+              <span className="block truncate text-[11px] text-muted-foreground">
+                {host}
+              </span>
+            </div>
+          </div>
+
+          <a
+            href={link.url}
+            target="_blank"
+            rel="noopener noreferrer nofollow"
+            aria-label={`Open ${link.title}`}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border bg-card text-muted-foreground transition-colors group-hover:border-[#145338] group-hover:bg-[#145338] group-hover:text-white"
+          >
+            <ArrowUpRight className="h-4 w-4" aria-hidden />
+          </a>
+        </div>
+
+        {link.description ? (
+          <p className="mt-3 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
+            {link.description}
+          </p>
+        ) : null}
+
+        {link.tags.length > 0 ? (
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {link.tags.map((tag) => (
+              <Badge key={tag} variant="default">
+                #{tag}
+              </Badge>
+            ))}
+          </div>
+        ) : null}
       </div>
-      {link.description ? (
-        <p className="mt-1.5 line-clamp-2 text-sm text-muted-foreground">{link.description}</p>
-      ) : null}
-      {link.created_by ? (
-        <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-          <Avatar person={link.created_by} size="xs" />
-          <span className="truncate">Added by {displayName(link.created_by)}</span>
-          <span aria-hidden>·</span>
-          <time dateTime={link.created_at} className="whitespace-nowrap">
-            {formatReadable(link.created_at)}
-          </time>
-        </div>
-      ) : null}
-      {link.tags.length > 0 ? (
-        <div className="mt-2 flex flex-wrap gap-1">
-          {link.tags.map((tag) => (
-            <Badge key={tag} variant="muted">
-              {tag}
-            </Badge>
-          ))}
-        </div>
-      ) : null}
-      {link.allowed_actions.length > 0 ? (
-        <div className="mt-3 flex gap-1">
-          {link.allowed_actions.includes("edit") ? (
-            <Button variant="ghost" size="sm" onClick={onEdit}>
-              <Pencil className="h-3.5 w-3.5" aria-hidden />
-              Edit
-            </Button>
-          ) : null}
-          {link.allowed_actions.includes("delete") ? (
-            <Button variant="ghost" size="sm" onClick={onDelete}>
-              <Trash2 className="h-3.5 w-3.5" aria-hidden />
-              Delete
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
+
+      <div className="mt-4 flex items-center justify-between border-t border-border/60 pt-3">
+        {link.created_by ? (
+          <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+            <Avatar person={link.created_by} size="xs" />
+            <span className="truncate font-medium text-foreground/80">
+              {displayName(link.created_by)}
+            </span>
+            <span aria-hidden>·</span>
+            <time dateTime={link.created_at} className="whitespace-nowrap text-[11px]">
+              {formatReadable(link.created_at)}
+            </time>
+          </div>
+        ) : (
+          <span className="text-xs text-muted-foreground">Workspace resource</span>
+        )}
+
+        {link.allowed_actions.length > 0 ? (
+          <div className="flex shrink-0 items-center gap-1">
+            {link.allowed_actions.includes("edit") ? (
+              <Button variant="ghost" size="sm" onClick={onEdit} aria-label="Edit link">
+                <Pencil className="h-3.5 w-3.5" aria-hidden />
+              </Button>
+            ) : null}
+            {link.allowed_actions.includes("delete") ? (
+              <Button variant="ghost" size="sm" onClick={onDelete} aria-label="Delete link">
+                <Trash2 className="h-3.5 w-3.5" aria-hidden />
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
     </Card>
   );
 }
@@ -423,11 +637,13 @@ function LinkCard({
 function SearchResults({
   result,
   isLoading,
+  onSelectFolder,
   onEditLink,
   onDeleteLink,
 }: {
   result?: SearchResult;
   isLoading: boolean;
+  onSelectFolder: (id: number) => void;
   onEditLink: (link: ResourceLink) => void;
   onDeleteLink: (link: ResourceLink) => void;
 }) {
@@ -439,27 +655,34 @@ function SearchResults({
     <div className="flex flex-col gap-5">
       {result.folders.length > 0 ? (
         <div>
-          <h2 className="mb-2 text-sm font-semibold">Folders</h2>
-          <Card>
-            <ul>
-              {result.folders.map((folder) => (
-                <li key={folder.id} className="border-b border-border px-4 py-2.5 text-sm last:border-b-0">
-                  {folder.name}
+          <h2 className="mb-2.5 text-sm font-semibold">Matching Folders</h2>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {result.folders.map((folder) => (
+              <Card
+                key={folder.id}
+                className="cursor-pointer p-4 transition-colors hover:border-[#145338]/40"
+                onClick={() => onSelectFolder(folder.id)}
+              >
+                <div className="flex items-center gap-2.5">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-[#eaf4ef] text-[#145338]">
+                    <Folder className="h-4 w-4" aria-hidden />
+                  </span>
+                  <span className="font-semibold">{folder.name}</span>
                   {folder.visibility === "management" ? (
-                    <Badge variant="warning" className="ml-2">
+                    <Badge variant="warning" className="ml-auto">
                       Management only
                     </Badge>
                   ) : null}
-                </li>
-              ))}
-            </ul>
-          </Card>
+                </div>
+              </Card>
+            ))}
+          </div>
         </div>
       ) : null}
       {result.links.length > 0 ? (
         <div>
-          <h2 className="mb-2 text-sm font-semibold">Links</h2>
-          <div className="grid gap-3 sm:grid-cols-2">
+          <h2 className="mb-2.5 text-sm font-semibold">Matching Links</h2>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             {result.links.map((link) => (
               <LinkCard
                 key={link.id}
@@ -483,8 +706,8 @@ function FolderDialog({
   onDone,
 }: {
   open: boolean;
-  folder: Folder | null;
-  folders: Folder[];
+  folder: FolderType | null;
+  folders: FolderType[];
   onClose: () => void;
   onDone: () => void;
 }) {
@@ -589,7 +812,7 @@ function LinkDialog({
 }: {
   open: boolean;
   link: ResourceLink | null;
-  folders: Folder[];
+  folders: FolderType[];
   defaultFolderId: number | null;
   onClose: () => void;
   onDone: () => void;

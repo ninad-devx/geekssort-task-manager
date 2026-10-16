@@ -16,7 +16,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    APP_NAME: str = "MarketingOS"
+    APP_NAME: str = "Taskssort"
     APP_TIMEZONE: str = "UTC"
     DATABASE_URL: str = f"sqlite:///{BACKEND_DIR / 'data' / 'marketingos.db'}"
 
@@ -26,7 +26,14 @@ class Settings(BaseSettings):
     SESSION_ABSOLUTE_DAYS: int = 7
     SESSION_TOUCH_MINUTES: int = 5
     LOGIN_FAIL_LIMIT: int = 5
+    # A second bucket keyed on the client address alone. Without it one attacker
+    # can spray a single password guess across every email and never trip the
+    # per-(email, ip) limit.
+    LOGIN_FAIL_IP_LIMIT: int = 25
     LOGIN_FAIL_WINDOW_MINUTES: int = 15
+    # Only enable behind a proxy you control, otherwise a client can spoof its
+    # own address and walk straight through the rate limit.
+    TRUST_PROXY_HEADERS: bool = False
     CSRF_HEADER_NAME: str = "x-requested-with"
     CSRF_HEADER_VALUE: str = "marketingos"
 

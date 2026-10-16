@@ -26,7 +26,7 @@ from app.schemas import (
     LinkUpdateIn,
 )
 from app.security import TAG_RE, normalize_tag, validate_url
-from app.serializers import folder_out, link_out
+from app.serializers import folder_counts, folder_out, link_out
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
 
@@ -124,7 +124,9 @@ def _set_tags(db: Session, link: ResourceLink, tags: list[str]) -> None:
 @router.get("/folders", response_model=list[FolderOut])
 def list_folders(current: CurrentUser = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = db.scalars(_visible_folders_stmt(current).order_by(Folder.name)).all()
-    return [folder_out(current.user, f, db) for f in rows]
+    # Two counts for the whole page instead of two per folder.
+    counts = folder_counts(db, [f.id for f in rows])
+    return [folder_out(current.user, f, db, counts.get(f.id)) for f in rows]
 
 
 @router.post("/folders", response_model=FolderOut, status_code=201)
@@ -458,8 +460,13 @@ def update_link(
             "url": link.url,
             "description": link.description,
             "folder_id": link.folder_id,
+            "task_id": link.task_id,
             "tags": [t.tag for t in link.tags],
         }
+        # `model_fields_set` is the only way to tell "leave it alone" from
+        # "detach it". Checking `is not None` meant an explicit null was
+        # ignored, so a link could never be taken out of its folder.
+        sent = payload.model_fields_set
         if payload.url is not None:
             problem = validate_url(payload.url)
             if problem:
@@ -467,11 +474,18 @@ def update_link(
             link.url = payload.url.strip()
         if payload.title is not None:
             link.title = payload.title.strip()
-        if payload.description is not None:
+        if "description" in sent:
             link.description = payload.description
-        if payload.folder_id is not None:
-            folder = _load_folder(current, db, payload.folder_id)
-            link.folder_id = folder.id
+        if "folder_id" in sent:
+            if payload.folder_id is None:
+                link.folder_id = None
+            else:
+                link.folder_id = _load_folder(current, db, payload.folder_id).id
+        if "task_id" in sent:
+            if payload.task_id is None:
+                link.task_id = None
+            else:
+                link.task_id = policy.get_visible_task(current.user, payload.task_id, db).id
         if payload.tags is not None:
             _set_tags(db, link, _validate_tags(payload.tags))
         link.updated_at = utcnow()
@@ -480,6 +494,7 @@ def update_link(
             "url": link.url,
             "description": link.description,
             "folder_id": link.folder_id,
+            "task_id": link.task_id,
             "tags": [t.tag for t in link.tags],
         }
         if before != after:
@@ -562,8 +577,11 @@ def search(
         .limit(50)
     ).all()
 
+    folder_counts_for_hits = folder_counts(db, [f.id for f in folders])
     return {
         "query": q,
-        "folders": [folder_out(current.user, f, db) for f in folders],
+        "folders": [
+            folder_out(current.user, f, db, folder_counts_for_hits.get(f.id)) for f in folders
+        ],
         "links": [link_out(current.user, link) for link in links],
     }

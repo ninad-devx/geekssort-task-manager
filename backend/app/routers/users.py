@@ -407,10 +407,22 @@ def reset_password(
         if problem:
             raise unprocessable("WEAK_PASSWORD", problem)
         now = utcnow()
+        is_self = target.id == current.user.id
         target.password_hash = hash_password(password)
-        target.must_change_password = payload.new_password is None
+        # Do not force must_change_password on the admin's own active session
+        # (or when an explicit password was set), otherwise the admin UI is
+        # immediately kicked out before they can copy the password.
+        target.must_change_password = (payload.new_password is None) and (not is_self)
         target.updated_at = now
-        db.execute(delete(SessionRow).where(SessionRow.user_id == target.id))
+        if is_self:
+            db.execute(
+                delete(SessionRow).where(
+                    SessionRow.user_id == target.id,
+                    SessionRow.id != current.session.id,
+                )
+            )
+        else:
+            db.execute(delete(SessionRow).where(SessionRow.user_id == target.id))
         audit.record(
             db,
             event_type=EventType.password_reset.value,

@@ -61,9 +61,13 @@ def list_notifications(
 
     items: list[NotificationOut] = []
     seen_tasks: set[int] = set()
+    loaded: dict[int, Task | None] = {}
 
     for event in rows:
-        task = db.get(Task, event.task_id) if event.task_id else None
+        task_id = event.task_id
+        if task_id not in loaded:
+            loaded[task_id] = db.get(Task, task_id)
+        task = loaded[task_id]
         if task is None or task.deleted_at is not None:
             continue
         if task.assignee_id != user.id:
@@ -71,9 +75,9 @@ def list_notifications(
         if event.actor_id == user.id:
             continue  # they did it themselves; that is not a notification
         # A reassignment emits several events; only the latest one matters.
-        if event.task_id in seen_tasks:
+        if task_id in seen_tasks:
             continue
-        seen_tasks.add(event.task_id)
+        seen_tasks.add(task_id)
 
         is_reminder = event.event_type == REMINDER_EVENT
         detail = ""
@@ -94,6 +98,11 @@ def list_notifications(
                 actor_name=event.actor_name,
                 actor_id=event.actor_id,
                 created_at=event.created_at,
+                # Everything this endpoint returns is newer than the watermark
+                # the client sent -- or the client sent no watermark at all and
+                # has therefore displayed nothing. Either way these are new to
+                # that device. `unread` below counts exactly this list, so the
+                # badge and the flag can no longer contradict each other.
                 is_new=True,
                 is_reminder=is_reminder,
                 message=detail or None,
@@ -102,6 +111,6 @@ def list_notifications(
 
     return NotificationListOut(
         items=items,
-        unread=len(items) if since is not None else 0,
+        unread=len(items),
         server_time=utcnow(),
     )

@@ -1,10 +1,10 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, SESSION_EXPIRED_EVENT } from "@/lib/api";
 import type { Capabilities, DirectoryEntry, SessionInfo, User } from "@/lib/types";
 
 interface AuthValue {
@@ -26,10 +26,16 @@ const AuthContext = createContext<AuthValue | null>(null);
 const SESSION_KEY = ["session"];
 
 /**
- * Reads the session from the query cache. It is never fetched from here: the server
- * layout (src/app/(app)/layout.tsx) resolves it before the page renders and seeds the
- * cache. That is what makes an unauthenticated visitor get a real redirect instead of
- * an endless "Checking your session" spinner.
+ * Reads the session from the query cache. The server layout resolves it before
+ * the page renders and seeds the cache, which is what makes an unauthenticated
+ * visitor get a real redirect instead of an endless "Checking your session"
+ * spinner.
+ *
+ * `enabled: false` was never lifted, so the session was read once at first
+ * paint and never again: a cookie that expired four hours into a shift left
+ * every query 401-ing with nothing on screen to explain it. Revalidation now
+ * runs on window focus, and any 401 anywhere in the app sends the person back
+ * to the login page.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
@@ -39,13 +45,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     queryKey: SESSION_KEY,
     queryFn: () => api<SessionInfo>("/auth/me"),
     retry: false,
-    staleTime: 30_000,
-    enabled: false, // seeded by the server render; refreshed manually after a mutation
+    staleTime: 60_000,
+    refetchOnWindowFocus: true,
+    refetchInterval: 5 * 60_000,
   });
 
-  const invalidate = useCallback(async () => {
-    await queryClient.invalidateQueries();
-  }, [queryClient]);
+  // One 401 anywhere means the cookie is gone. Clear the cache so nothing stale
+  // is rendered on the way out, then send them to sign in again.
+  useEffect(() => {
+    const onExpired = () => {
+      queryClient.clear();
+      router.replace("/login");
+      router.refresh();
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+  }, [queryClient, router]);
 
   const loginMutation = useMutation({
     mutationFn: (input: { email: string; password: string }) =>
@@ -64,10 +79,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     },
   });
 
+  /** Re-read the session so a change to your own powers applies immediately. */
+  const refreshSession = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: SESSION_KEY }),
+    [queryClient],
+  );
+
   const changePasswordMutation = useMutation({
     mutationFn: (input: { current_password: string; new_password: string }) =>
       api<void>("/auth/change-password", { method: "POST", json: input }),
-    onSuccess: invalidate,
+    onSuccess: refreshSession,
   });
 
   // Editing your own display name, picture or colour is allowed for everybody,
@@ -78,9 +99,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       avatar_url?: string | null;
       avatar_color?: string | null;
     }) => api<User>(`/users/${session?.user.id}`, { method: "PATCH", json: input }),
-    onSuccess: async () => {
-      await invalidate();
-    },
+    onSuccess: refreshSession,
   });
 
   const value = useMemo<AuthValue>(
@@ -126,6 +145,15 @@ export function useDirectory() {
     queryFn: () => api<DirectoryEntry[]>("/users/directory"),
     staleTime: 5 * 60_000,
   });
+}
+
+/** Re-reads the session. Use after anything that can change your own powers. */
+export function useRefreshSession() {
+  const queryClient = useQueryClient();
+  return useCallback(
+    () => queryClient.invalidateQueries({ queryKey: SESSION_KEY }),
+    [queryClient],
+  );
 }
 
 export function isUnauthorized(error: unknown): boolean {

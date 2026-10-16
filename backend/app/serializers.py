@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app import policy
+from app import aggregate, policy
 from app.config import settings
 from app.models import (
     AuditEvent,
@@ -58,24 +58,53 @@ def is_overdue(task: Task, now=None) -> bool:
 
 
 def tracked_seconds(db: Session, task_id: int) -> int:
-    total = db.scalar(
-        select(func.coalesce(func.sum(WorkSession.duration_seconds), 0)).where(
-            WorkSession.task_id == task_id,
-            WorkSession.deleted_at.is_(None),
-            WorkSession.ended_at.is_not(None),
-        )
-    )
-    return int(total or 0)
+    """Closed seconds plus whatever is accruing on an open timer right now."""
+    return aggregate.tracked_seconds(db, task_id)
 
 
-def running_session_for_task(db: Session, task_id: int) -> WorkSession | None:
-    return db.scalar(
-        select(WorkSession).where(
-            WorkSession.task_id == task_id,
-            WorkSession.ended_at.is_(None),
-            WorkSession.deleted_at.is_(None),
-        )
+class TaskContext:
+    """Preloaded per-task lookups for one page of results.
+
+    Without it `task_out` issued four queries per row -- a running-timer lookup,
+    a log count, a tracked-seconds sum and another running-timer lookup for the
+    allowed-action decision. A 25-row page cost roughly a hundred queries.
+    """
+
+    __slots__ = ("user", "now", "running", "mine", "tracked", "log_counts")
+
+    def __init__(self, db: Session, user: User, tasks, now=None):
+        self.user = user
+        self.now = now or utcnow()
+        ids = [t.id for t in tasks]
+        self.running = aggregate.running_by_task(db, ids)
+        self.mine = aggregate.running_by_task_for_user(db, ids, user.id)
+        self.tracked = aggregate.tracked_seconds_by_task(db, ids)
+        self.log_counts = aggregate.log_counts_by_task(db, ids)
+
+
+def running_timer_out(task: Task, log: WorkSession, viewer_id: int, now) -> RunningTimer:
+    return RunningTimer(
+        log_id=log.id,
+        task_id=task.id,
+        task_title=task.title,
+        started_at=log.started_at,
+        elapsed_seconds=elapsed(log, now),
+        is_stale=is_stale(log, now),
+        user_id=log.user_id,
+        user=actor_out(log.user),
+        is_mine=log.user_id == viewer_id,
     )
+
+
+def running_session_for_task(db: Session, task_id: int, user_id: int | None = None) -> WorkSession | None:
+    stmt = select(WorkSession).where(
+        WorkSession.task_id == task_id,
+        WorkSession.ended_at.is_(None),
+        WorkSession.deleted_at.is_(None),
+    )
+    if user_id is not None:
+        stmt = stmt.where(WorkSession.user_id == user_id)
+    return db.scalar(stmt)
 
 
 def running_sessions_for_user(db: Session, user_id: int) -> list[WorkSession]:
@@ -129,7 +158,13 @@ def is_stale(session: WorkSession, now=None) -> bool:
 
 # --- allowed actions -------------------------------------------------------
 
-def task_allowed_actions(user: User, task: Task, db: Session, now=None) -> list[str]:
+def task_allowed_actions(
+    user: User,
+    task: Task,
+    db: Session,
+    now=None,
+    ctx: "TaskContext | None" = None,
+) -> list[str]:
     now = now or utcnow()
     actions: list[str] = []
     if task.deleted_at is not None:
@@ -149,7 +184,10 @@ def task_allowed_actions(user: User, task: Task, db: Session, now=None) -> list[
         actions.append("reassign")
 
     if policy.can_track_time(user, task):
-        own_running = running_session_for_user_task(db, user.id, task.id)
+        if ctx is not None:
+            own_running = ctx.mine.get(task.id)
+        else:
+            own_running = running_session_for_user_task(db, user.id, task.id)
         if own_running is not None:
             actions.append("pause_timer")
         elif task.status != TaskStatus.completed.value:
@@ -180,24 +218,28 @@ def log_allowed_actions(user: User, log: WorkSession, db: Session) -> list[str]:
 
 # --- serializers -----------------------------------------------------------
 
-def task_out(user: User, task: Task, db: Session, now=None, with_actions: bool = True) -> TaskOut:
+def task_out(
+    user: User,
+    task: Task,
+    db: Session,
+    now=None,
+    with_actions: bool = True,
+    ctx: "TaskContext | None" = None,
+) -> TaskOut:
     now = now or utcnow()
-    running = running_session_for_task(db, task.id)
-    run_block = None
-    if running is not None:
-        run_block = RunningTimer(
-            log_id=running.id,
-            task_id=task.id,
-            task_title=task.title,
-            started_at=running.started_at,
-            elapsed_seconds=elapsed(running, now),
-            is_stale=is_stale(running, now),
-        )
-    log_count = db.scalar(
-        select(func.count()).select_from(WorkSession).where(
-            WorkSession.task_id == task.id, WorkSession.deleted_at.is_(None)
-        )
-    )
+    if ctx is None:
+        ctx = TaskContext(db, user, [task], now)
+
+    # `running` is the caller's own timer and nothing else. It used to be any
+    # user's timer on the task, which made a viewer offer to pause a colleague's
+    # clock -- the id went straight into POST /timer/pause.
+    mine = ctx.mine.get(task.id)
+    run_block = running_timer_out(task, mine, user.id, now) if mine is not None else None
+    others = [
+        running_timer_out(task, log, user.id, now)
+        for log in ctx.running.get(task.id, [])
+        if log.id != (mine.id if mine is not None else None)
+    ]
     return TaskOut(
         id=task.id,
         title=task.title,
@@ -222,10 +264,11 @@ def task_out(user: User, task: Task, db: Session, now=None, with_actions: bool =
         updated_at=task.updated_at,
         version=task.version,
         is_overdue=is_overdue(task, now),
-        tracked_seconds=tracked_seconds(db, task.id),
+        tracked_seconds=ctx.tracked.get(task.id, 0),
         running=run_block,
-        allowed_actions=task_allowed_actions(user, task, db, now) if with_actions else [],
-        log_count=int(log_count or 0),
+        other_runners=others,
+        allowed_actions=task_allowed_actions(user, task, db, now, ctx) if with_actions else [],
+        log_count=ctx.log_counts.get(task.id, 0),
     )
 
 
@@ -310,15 +353,35 @@ def link_out(user: User, link: ResourceLink) -> LinkOut:
     )
 
 
-def folder_out(user: User, folder: Folder, db: Session) -> FolderOut:
-    from sqlalchemy import func as _f
+def folder_counts(db: Session, folder_ids: list[int]) -> dict[int, dict[str, int]]:
+    """Link and child counts for a whole page of folders in two queries."""
+    if not folder_ids:
+        return {}
+    links = db.execute(
+        select(ResourceLink.folder_id, func.count())
+        .where(ResourceLink.folder_id.in_(folder_ids), ResourceLink.deleted_at.is_(None))
+        .group_by(ResourceLink.folder_id)
+    ).all()
+    children = db.execute(
+        select(Folder.parent_id, func.count())
+        .where(Folder.parent_id.in_(folder_ids), Folder.deleted_at.is_(None))
+        .group_by(Folder.parent_id)
+    ).all()
+    out = {fid: {"link_count": 0, "child_count": 0} for fid in folder_ids}
+    for fid, n in links:
+        if fid in out:
+            out[fid]["link_count"] = int(n or 0)
+    for pid, n in children:
+        if pid in out:
+            out[pid]["child_count"] = int(n or 0)
+    return out
 
-    link_count = db.scalar(
-        _f_count(db, ResourceLink, ResourceLink.folder_id == folder.id)
-    ) or 0
-    child_count = db.scalar(
-        _f_count(db, Folder, Folder.parent_id == folder.id, Folder.deleted_at.is_(None))
-    ) or 0
+
+def folder_out(
+    user: User, folder: Folder, db: Session, counts: dict[str, int] | None = None
+) -> FolderOut:
+    if counts is None:
+        counts = folder_counts(db, [folder.id]).get(folder.id, {})
     actions = ["edit", "delete", "move"] if policy.can_manage_folder(user) else []
     return FolderOut(
         id=folder.id,
@@ -328,15 +391,7 @@ def folder_out(user: User, folder: Folder, db: Session) -> FolderOut:
         visibility=folder.visibility,
         depth=folder.depth,
         created_at=folder.created_at,
-        link_count=int(link_count),
-        child_count=int(child_count),
+        link_count=int(counts.get("link_count", 0)),
+        child_count=int(counts.get("child_count", 0)),
         allowed_actions=actions,
-    )
-
-
-def _f_count(db: Session, model, *conditions):
-    return (
-        select(func.count())
-        .select_from(model)
-        .where(*conditions, model.deleted_at.is_(None))
     )

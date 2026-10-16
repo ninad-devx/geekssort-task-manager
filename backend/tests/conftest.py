@@ -28,7 +28,8 @@ def client():
     Base = __import__("app.models", fromlist=["Base"]).Base
     Base.metadata.drop_all(bind=engine)
     init_db()
-    auth_router._failures.clear()  # in-memory rate-limit state must not leak between tests
+    # Login throttling now lives in `login_attempts`, which the schema reset
+    # above already clears.
     with TestClient(app) as c:
         yield c
     Base.metadata.drop_all(bind=engine)

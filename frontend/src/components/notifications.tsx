@@ -3,7 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Bell } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { Badge } from "@/components/ui/form";
 import { api } from "@/lib/api";
@@ -47,11 +47,6 @@ function useStoredFlag(key: string): [string | null, (value: string | null) => v
   return [value, set];
 }
 
-function useSeenSince() {
-  const [seen, setSeen] = useStoredFlag(SEEN_KEY);
-  return [seen ?? undefined, setSeen] as const;
-}
-
 /** A short, quiet chime synthesised locally so no audio asset has to ship. */
 function playChime() {
   try {
@@ -79,7 +74,16 @@ function playChime() {
   }
 }
 
-function useNotifications(since: string | undefined) {
+/**
+ * Always runs.
+ *
+ * This used to be `enabled: since !== undefined`, and `since` comes from
+ * localStorage. For anyone who had never opened the bell the flag was unset,
+ * `since` was undefined, the query never fired, and the whole feature -- badge,
+ * panel and banner -- was inert until a first click that only a person hunting
+ * for it would make. Fetching unconditionally is what makes it work.
+ */
+function useNotifications(since: string | null) {
   return useQuery({
     queryKey: ["notifications", since ?? "all"],
     queryFn: () =>
@@ -87,86 +91,148 @@ function useNotifications(since: string | undefined) {
         `/notifications${since ? `?since=${encodeURIComponent(since)}` : ""}`,
       ),
     refetchInterval: 30_000,
-    enabled: since !== undefined,
+    refetchOnWindowFocus: true,
   });
 }
 
 export function NotificationBell() {
-  const [since, setSeen] = useSeenSince();
+  const [seenRaw, setSeen] = useStoredFlag(SEEN_KEY);
   const [soundRaw, setSoundRaw] = useStoredFlag(SOUND_KEY);
   const soundOn = soundRaw === "on";
-  const primed = useRef(false);
+  const [open, setOpen] = useState(false);
+  const wrapper = useRef<HTMLDivElement>(null);
 
-  const { data } = useNotifications(since);
-  const fresh = data?.items ?? [];
+  const seen = seenRaw ?? null;
+  const { data } = useNotifications(seen);
+  const items = useMemo(() => data?.items ?? [], [data]);
 
-  // Sound once the user has opted in, and only for genuinely new arrivals.
+  // Until this device has a watermark we cannot say any of this is *new*, so
+  // there is no badge. The list is still fully readable.
+  const unread = seen ? items.length : 0;
+
+  const markSeen = useCallback(() => {
+    if (seen && data) return;
+    setSeen(data?.server_time ?? new Date().toISOString());
+  }, [seen, data, setSeen]);
+
+  // Opening and reading are separate things. `markSeen` used to run on click
+  // and on every item click, which immediately emptied the list and unmounted
+  // the panel -- so the bell could never be opened twice.
+  const dismiss = useCallback(() => {
+    setOpen(false);
+    markSeen();
+  }, [markSeen]);
+
   useEffect(() => {
-    if (!primed.current) {
-      primed.current = true;
-      return;
-    }
-    if (soundOn && fresh.length > 0) playChime();
-  }, [fresh.length, soundOn]);
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!wrapper.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") dismiss();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, dismiss]);
 
-  const markSeen = () => setSeen(data?.server_time ?? new Date().toISOString());
+  // Chime once per genuinely new arrival. The previous effect keyed off
+  // `fresh.length`, so `toggleSound` and the effect both fired and every page
+  // load replayed the sound.
+  const chimed = useRef<string | null>(null);
+  useEffect(() => {
+    if (!seen || !soundOn || items.length === 0) return;
+    const newest = String(items[0].id);
+    if (newest === chimed.current) return;
+    chimed.current = newest;
+    playChime();
+  }, [seen, soundOn, items]);
 
-  const toggleSound = () => {
-    const next = !soundOn;
-    setSoundRaw(next ? "on" : "off");
-    if (next) playChime();
-  };
-
-  const visible = fresh.slice(0, 8);
+  const toggleSound = () => setSoundRaw(soundOn ? "off" : "on");
 
   return (
-    <div className="relative flex flex-col items-center">
+    <div className="relative flex items-center" ref={wrapper}>
       <button
         type="button"
-        onClick={markSeen}
-        className="relative rounded-full p-2 hover:bg-muted"
-        title="Mark notifications as seen"
-        aria-label={`Notifications${fresh.length ? `, ${fresh.length} new` : ""}`}
+        onClick={() => (open ? dismiss() : setOpen(true))}
+        className="relative flex h-10 w-10 items-center justify-center rounded-full border border-border/70 bg-card text-foreground shadow-2xs transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        title={unread ? `${unread} new` : "Notifications"}
+        aria-label={unread ? `Notifications, ${unread} new` : "Notifications"}
+        aria-expanded={open}
+        aria-haspopup="dialog"
       >
-        <Bell className="h-5 w-5" aria-hidden />
-        {fresh.length > 0 ? (
-          <span className="absolute right-0 top-0 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold text-white">
-            {fresh.length}
+        <Bell className="h-[18px] w-[18px] text-muted-foreground" aria-hidden />
+        {unread > 0 ? (
+          <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#145338] px-1 text-[10px] font-semibold text-white">
+            {unread > 99 ? "99+" : unread}
           </span>
         ) : null}
       </button>
-      <label className="flex cursor-pointer items-center gap-1 text-[10px] text-muted-foreground">
-        <input type="checkbox" checked={soundOn} onChange={toggleSound} className="h-3 w-3" />
-        sound
-      </label>
 
-      {visible.length > 0 ? (
-        <div className="absolute right-0 top-full z-50 mt-1 w-80 rounded-lg border border-border bg-card p-2 shadow-lg">
-          <p className="px-2 py-1 text-xs font-medium text-muted-foreground">Assigned to you</p>
-          <ul className="max-h-72 overflow-y-auto">
-            {visible.map((n) => (
-              <li key={n.id}>
-                <Link
-                  href={`/tasks/${n.task_id}`}
-                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted"
+      {open ? (
+        <div
+          role="dialog"
+          aria-label="Notifications"
+          className="absolute right-0 top-full z-50 mt-2 w-80 rounded-2xl border border-border bg-card p-3 shadow-xl"
+        >
+          <div className="flex items-center justify-between border-b border-border/60 pb-2">
+            <p className="text-xs font-semibold text-foreground">
+              {unread > 0 ? `${unread} new` : "Assigned to you"}
+            </p>
+            <div className="flex items-center gap-3">
+              <label className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={soundOn}
+                  onChange={toggleSound}
+                  className="h-3 w-3 accent-[#145338]"
+                />
+                sound
+              </label>
+              {items.length > 0 ? (
+                <button
+                  type="button"
                   onClick={markSeen}
+                  className="text-xs font-medium text-[#145338] hover:underline"
                 >
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate">
-                      {n.is_reminder ? "Reminder: " : ""}
-                      {n.task_title}
+                  Mark all read
+                </button>
+              ) : null}
+            </div>
+          </div>
+          {items.length === 0 ? (
+            <p className="px-2 py-5 text-center text-sm text-muted-foreground">
+              Nothing has been assigned to you yet.
+            </p>
+          ) : (
+            <ul className="mt-1.5 max-h-72 space-y-0.5 overflow-y-auto">
+              {items.slice(0, 20).map((n) => (
+                <li key={n.id}>
+                  <Link
+                    href={`/tasks/${n.task_id}`}
+                    className="flex items-center gap-2 rounded-xl px-2.5 py-2 text-sm transition-colors hover:bg-muted"
+                    onClick={dismiss}
+                  >
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium text-foreground">
+                        {n.is_reminder ? "Reminder: " : ""}
+                        {n.task_title}
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        {n.is_reminder ? "needs your attention — from " : "from "}
+                        {n.actor_name}
+                        {n.message ? `: ${n.message}` : ""}
+                      </span>
                     </span>
-                    <span className="block text-xs text-muted-foreground">
-                      {n.is_reminder ? "needs your attention — from " : "from "}
-                      {n.actor_name}
-                      {n.message ? `: ${n.message}` : ""}
-                    </span>
-                  </span>
-                  <Badge variant="outline">{STATUS_LABELS[n.task_status]}</Badge>
-                </Link>
-              </li>
-            ))}
-          </ul>
+                    <Badge variant="outline">{STATUS_LABELS[n.task_status]}</Badge>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       ) : null}
     </div>
@@ -175,17 +241,20 @@ export function NotificationBell() {
 
 /** A pinned strip under the header while an assignment is unread. */
 export function AssignmentBanner() {
-  const [since, setSeen] = useSeenSince();
-  const { data } = useNotifications(since);
+  const [seenRaw, setSeen] = useStoredFlag(SEEN_KEY);
+  const seen = seenRaw ?? null;
+  const { data } = useNotifications(seen);
   const items = data?.items ?? [];
 
-  if (since === undefined || items.length === 0) return null;
+  if (!seen || items.length === 0) return null;
+
+  const dismiss = () => setSeen(data?.server_time ?? new Date().toISOString());
 
   return (
-    <div className="border-b border-warning/40 bg-warning/10 px-4 py-2">
-      <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-2 text-sm">
-        <Bell className="h-4 w-4 text-warning" aria-hidden />
-        <span className="font-medium">
+    <div className="mb-4 rounded-2xl border border-[#145338]/20 bg-[#eaf4ef] px-4 py-2.5">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <Bell className="h-4 w-4 text-[#145338]" aria-hidden />
+        <span className="font-medium text-[#145338]">
           {items.length} new {items.some((n) => n.is_reminder) ? "reminder" : "task"}
           {items.length === 1 ? "" : "s"} assigned to you
         </span>
@@ -193,18 +262,17 @@ export function AssignmentBanner() {
           <Link
             key={n.id}
             href={`/tasks/${n.task_id}`}
-            className="inline-flex items-center gap-1 underline-offset-2 hover:underline"
-            onClick={() => setSeen(data?.server_time ?? new Date().toISOString())}
+            className="inline-flex items-center gap-1 font-medium text-foreground underline-offset-2 hover:underline"
+            onClick={dismiss}
           >
-            {n.is_reminder ? "🔔 " : ""}
             {n.task_title}
             <span className="text-xs text-muted-foreground">({n.actor_name})</span>
           </Link>
         ))}
         <button
           type="button"
-          onClick={() => setSeen(data?.server_time ?? new Date().toISOString())}
-          className="ml-auto text-xs text-muted-foreground hover:text-foreground"
+          onClick={dismiss}
+          className="ml-auto text-xs font-medium text-[#145338] hover:underline"
         >
           Dismiss
         </button>

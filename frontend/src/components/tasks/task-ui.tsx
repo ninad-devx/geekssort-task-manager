@@ -7,8 +7,8 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Badge, Input, Progress } from "@/components/ui/form";
-import { api, ApiError } from "@/lib/api";
-import { formatDuration } from "@/lib/format";
+import { api, errorMessage } from "@/lib/api";
+import { formatDuration, overdueDays } from "@/lib/format";
 import { PRIORITY_LABELS, STATUS_LABELS, type Priority, type Task, type TaskStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -67,27 +67,27 @@ export function TimerActions({
       }
       onChanged();
     } catch (error) {
-      toast.error(error instanceof ApiError ? error.message : "Could not start the timer");
+      toast.error(errorMessage(error));
     } finally {
       setBusy(false);
     }
   };
 
-  const runningLogId = task.running?.log_id;
-
   const pause = async () => {
     setBusy(true);
     try {
       // Timers are concurrent, so pause this task's timer by id rather than
-      // whichever one happens to be "current".
+      // whichever one happens to be "current". `running` is now guaranteed to
+      // be the caller's own timer -- it used to be any user's, so this could
+      // pause a colleague's session.
       await api("/timer/pause", {
         method: "POST",
-        json: runningLogId ? { log_id: runningLogId } : {},
+        json: task.running ? { log_id: task.running.log_id } : {},
       });
       toast.success("Timer paused");
       onChanged();
     } catch (error) {
-      toast.error(error instanceof ApiError ? error.message : "Could not pause the timer");
+      toast.error(errorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -113,6 +113,25 @@ export function TimerActions({
   return null;
 }
 
+/**
+ * Who is working on this task right now.
+ *
+ * `task.running` is deliberately only ever the caller's own timer, so anything
+ * on this task belongs to somebody else and must not be shown as pausable.
+ */
+export function OtherRunners({ task }: { task: Task }) {
+  if (!task.other_runners?.length) return null;
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-success" aria-hidden />
+      {task.other_runners
+        .map((r) => r.user?.full_name ?? "Someone")
+        .join(", ")}{" "}
+      {task.other_runners.length === 1 ? "is" : "are"} on this now
+    </span>
+  );
+}
+
 export function TaskRow({
   task,
   today,
@@ -124,7 +143,7 @@ export function TaskRow({
   onChanged: () => void;
   canRemind?: boolean;
 }) {
-  const late = daysOverdue(task.due_date, today);
+  const late = overdueDays(task.due_date, today);
   const [reminding, setReminding] = useState(false);
   const [remindOpen, setRemindOpen] = useState(false);
   const [message, setMessage] = useState("");
@@ -145,21 +164,19 @@ export function TaskRow({
       setMessage("");
       onChanged();
     } catch (error) {
-      toast.error(
-        error instanceof ApiError ? error.message : "Could not send the reminder",
-      );
+      toast.error(errorMessage(error));
     } finally {
       setReminding(false);
     }
   };
 
   return (
-    <li className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+    <li className="flex items-start gap-3 border-b border-border/70 px-5 py-3.5 transition-colors hover:bg-muted/40 last:border-b-0">
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
           <Link
             href={`/tasks/${task.id}`}
-            className="truncate font-medium hover:underline"
+            className="truncate font-semibold text-foreground hover:text-[#145338] hover:underline"
           >
             {task.title}
           </Link>
@@ -170,7 +187,11 @@ export function TaskRow({
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
           <StatusBadge status={task.status} />
           <PriorityBadge priority={task.priority} />
-          {task.assignee ? <span>{task.assignee.full_name}</span> : <span>Unassigned</span>}
+          {task.assignee ? (
+            <span className="font-medium text-foreground/80">{task.assignee.full_name}</span>
+          ) : (
+            <span>Unassigned</span>
+          )}
           {task.due_date ? <span>Due {task.due_date}</span> : null}
           <TrackedTime seconds={task.tracked_seconds} />
           <span>{task.log_count} entries</span>
@@ -181,7 +202,7 @@ export function TaskRow({
           </div>
         ) : null}
         {remindOpen ? (
-          <div className="mt-2 flex flex-wrap items-center gap-2">
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
             <Input
               className="h-8 max-w-xs"
               placeholder="Reminder (optional)"
@@ -219,25 +240,17 @@ export function TaskRow({
   );
 }
 
-export function daysOverdue(dueDate: string | null, today: string): number | null {
-  if (!dueDate) return null;
-  const due = new Date(`${dueDate}T00:00:00Z`).getTime();
-  const now = new Date(`${today}T00:00:00Z`).getTime();
-  const days = Math.round((now - due) / 86_400_000);
-  return days > 0 ? days : null;
-}
-
 export function TaskCard({ task, today }: { task: Task; today: string }) {
-  const late = daysOverdue(task.due_date, today);
+  const late = overdueDays(task.due_date, today);
   return (
     <Link
       href={`/tasks/${task.id}`}
       className={cn(
-        "block rounded-lg border border-border bg-card p-4 transition-colors hover:border-primary/50",
+        "block rounded-2xl border border-border/80 bg-card p-4 shadow-[0_2px_10px_rgba(0,0,0,0.02)] transition-all hover:border-[#145338]/40",
       )}
     >
       <div className="flex items-start justify-between gap-2">
-        <p className="font-medium leading-snug">{task.title}</p>
+        <p className="font-semibold leading-snug">{task.title}</p>
         {late ? <OverdueBadge days={late} /> : null}
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">

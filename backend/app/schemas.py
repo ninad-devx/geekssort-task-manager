@@ -13,7 +13,8 @@ Camel = ConfigDict(populate_by_name=True)
 # --- auth ------------------------------------------------------------------
 
 class LoginIn(BaseModel):
-    email: str
+    email: str | None = None
+    username: str | None = None
     password: str
 
 
@@ -57,7 +58,7 @@ class DirectoryEntry(BaseModel):
 # --- users -----------------------------------------------------------------
 
 class UserCreateIn(BaseModel):
-    email: str = Field(min_length=3, max_length=320)
+    email: str = Field(min_length=2, max_length=320)
     full_name: str = Field(min_length=1, max_length=200)
     role: Role = Role.member
     is_admin: bool = False
@@ -272,6 +273,12 @@ class RunningTimer(BaseModel):
     started_at: datetime
     elapsed_seconds: int
     is_stale: bool
+    # Ownership is part of the payload. Without it a client cannot tell whether
+    # the timer is the caller's own -- the only one they may pause -- or belongs
+    # to somebody else who happens to be on the same task.
+    user_id: int
+    user: TaskActor | None = None
+    is_mine: bool = True
 
 
 class TaskOut(BaseModel):
@@ -299,7 +306,11 @@ class TaskOut(BaseModel):
     version: int
     is_overdue: bool
     tracked_seconds: int
+    # The caller's own open timer on this task, and only theirs.
     running: RunningTimer | None = None
+    # Anyone else who has a timer open on it, so the UI can say "Sam is working
+    # on this" instead of silently rendering somebody else's clock as theirs.
+    other_runners: list[RunningTimer] = Field(default_factory=list)
     allowed_actions: list[str] = Field(default_factory=list)
     log_count: int = 0
 

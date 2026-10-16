@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import audit, policy, timelog, workflow
@@ -28,8 +29,8 @@ from app.schemas import (
     TaskOut,
     TaskUpdateIn,
 )
-from app.security import validate_evidence_url
-from app.serializers import is_overdue, local_today, task_out, tracked_seconds
+from app.security import escape_like, validate_evidence_url
+from app.serializers import TaskContext, is_overdue, local_today, task_out, tracked_seconds
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -39,6 +40,34 @@ OPEN_STATUSES = (
     TaskStatus.blocked.value,
     TaskStatus.in_review.value,
 )
+
+# Narrow Literals rather than free strings. `?status=banana` used to answer 200
+# with zero rows, and `?order=DROP` answered 200 as if it were `asc` -- a typo
+# was indistinguishable from a real filter that simply matched nothing.
+SortKey = Literal["due", "created", "updated", "title", "priority", "status"]
+SortOrder = Literal["asc", "desc"]
+StatusFilter = Literal["todo", "in_progress", "blocked", "in_review", "completed"]
+PriorityFilter = Literal["low", "medium", "high", "urgent"]
+
+SORT_COLUMNS = {
+    "due": Task.due_date,
+    "created": Task.created_at,
+    "updated": Task.updated_at,
+    "title": Task.title,
+    "status": Task.status,
+}
+
+
+def priority_rank():
+    """Sort by urgency, not by alphabet.
+
+    `priority` is a string column, so `ORDER BY priority` ranked
+    high < low < medium < urgent -- urgent work sorted last.
+    """
+    return case(
+        *[(Task.priority == p.value, i) for i, p in enumerate(Priority)],
+        else_=len(Priority),
+    )
 
 
 def _base_query(current: CurrentUser) -> Select:
@@ -82,8 +111,12 @@ def create_task(payload: TaskCreateIn, current: CurrentUser = Depends(get_curren
 
     assignee_id = payload.assignee_id
     if policy.can_assign_to_others(user):
-        if assignee_id is None:
-            assignee_id = user.id
+        # Honour whatever was sent, including None, which means "nobody yet".
+        # This used to rewrite None to the caller's own id, so the "Unassigned"
+        # option in the create dialog produced a task assigned to whoever
+        # created it, and the board's unassigned bucket could not be reached
+        # through the API at all.
+        pass
     else:
         if assignee_id is not None and assignee_id != user.id:
             raise forbidden("CANNOT_ASSIGN_OTHERS", "Members may only assign tasks to themselves")
@@ -144,8 +177,8 @@ def list_tasks(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
     q: str | None = None,
-    status: str | None = Query(default=None),
-    priority: str | None = Query(default=None),
+    status: StatusFilter | None = Query(default=None),
+    priority: PriorityFilter | None = Query(default=None),
     assignee_id: int | None = Query(default=None),
     category: str | None = Query(default=None),
     due_from: date | None = Query(default=None),
@@ -156,9 +189,13 @@ def list_tasks(
     completed_from: date | None = Query(default=None),
     completed_to: date | None = Query(default=None),
     include_deleted: bool = Query(default=False),
+    deleted_only: bool = Query(
+        default=False,
+        description="Show only soft-deleted tasks. Requires include_deleted's authority.",
+    ),
     mine: bool = Query(default=False),
-    sort: str = Query(default="due"),
-    order: str = Query(default="asc"),
+    sort: SortKey = Query(default="due"),
+    order: SortOrder = Query(default="asc"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
 ):
@@ -176,14 +213,19 @@ def list_tasks(
             )
         )
 
-    if include_deleted:
+    if include_deleted or deleted_only:
         if not policy.can_view_all_tasks(user):
             raise forbidden("CANNOT_VIEW_DELETED", "Only the CEO and team lead can view deleted tasks")
     else:
         stmt = stmt.where(Task.deleted_at.is_(None))
 
-    if q:
-        stmt = stmt.where(Task.title.ilike(f"%{q.strip()}%"))
+    # `include_deleted` mixed live and deleted rows together with no way to ask
+    # for one or the other, so "show me what we deleted" was not answerable.
+    if deleted_only:
+        stmt = stmt.where(Task.deleted_at.is_not(None))
+
+    if q and q.strip():
+        stmt = stmt.where(Task.title.ilike(f"%{escape_like(q.strip())}%", escape="\\"))
     if status:
         stmt = stmt.where(Task.status == status)
     if priority:
@@ -213,22 +255,20 @@ def list_tasks(
             Task.deleted_at.is_(None),
         )
 
-    sort_columns = {
-        "due": Task.due_date,
-        "created": Task.created_at,
-        "updated": Task.updated_at,
-        "title": Task.title,
-        "priority": Task.priority,
-        "status": Task.status,
-    }
-    column = sort_columns.get(sort, Task.due_date)
-    stmt = stmt.order_by(column.is_(None), column.desc() if order == "desc" else column.asc(), Task.id.desc())
+    column = priority_rank() if sort == "priority" else SORT_COLUMNS.get(sort, Task.due_date)
+    descending = order == "desc"
+    if sort == "priority":
+        stmt = stmt.order_by(column.desc() if descending else column.asc(), Task.id.desc())
+    else:
+        stmt = stmt.order_by(column.is_(None), column.desc() if descending else column.asc(), Task.id.desc())
 
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
     rows = db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
 
+    # One set of four queries for the whole page instead of four per row.
+    ctx = TaskContext(db, user, rows)
     return TaskListOut(
-        items=[task_out(user, t, db) for t in rows],
+        items=[task_out(user, t, db, ctx=ctx) for t in rows],
         total=total,
         page=page,
         page_size=page_size,
@@ -239,7 +279,11 @@ def list_tasks(
 def task_board(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-    status: str | None = Query(default=None),
+    status: StatusFilter | None = Query(default=None),
+    priority: PriorityFilter | None = Query(default=None),
+    assignee_id: int | None = Query(default=None),
+    category: str | None = Query(default=None),
+    overdue: bool | None = Query(default=None),
     q: str | None = Query(default=None),
     include_completed: bool = Query(default=False),
     completed_from: date | None = Query(default=None),
@@ -250,9 +294,11 @@ def task_board(
     The flat list answers "what is open"; this answers "who is carrying what",
     which is what a CEO or lead actually reads. It reuses the caller's normal
     task scope, so a member calling it still only ever sees their own work.
-    """
-    from app.serializers import is_overdue, local_today, tracked_seconds
 
+    Every filter the flat list honours is honoured here too. The board used to
+    accept priority, assignee, category and overdue and silently ignore them,
+    which left the picker looking functional while nothing happened.
+    """
     user = current.user
     if not policy.can_view_all_tasks(user):
         raise forbidden("FORBIDDEN", "The team board is for the CEO and team lead")
@@ -262,8 +308,20 @@ def task_board(
         stmt = stmt.where(Task.status == status)
     elif not include_completed:
         stmt = stmt.where(Task.status != TaskStatus.completed.value)
-    if q:
-        stmt = stmt.where(Task.title.ilike(f"%{q.strip()}%"))
+    if priority:
+        stmt = stmt.where(Task.priority == priority)
+    if assignee_id is not None:
+        stmt = stmt.where(Task.assignee_id == assignee_id)
+    if category:
+        stmt = stmt.where(Task.category == category)
+    if overdue:
+        stmt = stmt.where(
+            Task.due_date.is_not(None),
+            Task.due_date < local_today(),
+            Task.status != TaskStatus.completed.value,
+        )
+    if q and q.strip():
+        stmt = stmt.where(Task.title.ilike(f"%{escape_like(q.strip())}%", escape="\\"))
     if completed_from:
         stmt = stmt.where(
             Task.completed_at >= datetime.combine(completed_from, datetime.min.time())
@@ -273,8 +331,15 @@ def task_board(
             Task.completed_at <= datetime.combine(completed_to, datetime.max.time())
         )
 
-    rows = db.scalars(stmt.order_by(Task.due_date.is_(None), Task.due_date.asc(), Task.id.asc())).all()
+    rows = db.scalars(
+        stmt.order_by(
+            Task.due_date.is_(None), Task.due_date.asc(), priority_rank().asc(), Task.id.asc()
+        )
+    ).all()
     today = local_today()
+    now = utcnow()
+
+    ctx = TaskContext(db, user, rows, now)
 
     by_person: dict[int | None, list[Task]] = {}
     for task in rows:
@@ -299,10 +364,10 @@ def task_board(
                     role=assignee.role,
                 ),
                 open_count=len(open_tasks),
-                overdue_count=sum(1 for t in open_tasks if is_overdue(t, utcnow())),
+                overdue_count=sum(1 for t in open_tasks if is_overdue(t, now)),
                 blocked_count=sum(1 for t in open_tasks if t.status == TaskStatus.blocked.value),
-                tracked_seconds=sum(tracked_seconds(db, t.id) for t in open_tasks),
-                tasks=[task_out(user, t, db) for t in tasks],
+                tracked_seconds=sum(ctx.tracked.get(t.id, 0) for t in open_tasks),
+                tasks=[task_out(user, t, db, now, ctx=ctx) for t in tasks],
             )
         )
 
@@ -313,7 +378,7 @@ def task_board(
     return TaskBoardOut(
         people=people,
         unassigned_count=len(unassigned),
-        unassigned=[task_out(user, t, db) for t in unassigned],
+        unassigned=[task_out(user, t, db, now, ctx=ctx) for t in unassigned],
     )
 
 

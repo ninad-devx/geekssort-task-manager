@@ -1,16 +1,16 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { KeyRound, Plus, UserMinus } from "lucide-react";
+import { Check, CheckCircle2, Copy, KeyRound, Plus, ShieldCheck, UserMinus, Users } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader, roleLabel } from "@/components/app-shell";
+import { Avatar } from "@/components/avatar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
 import {
   Badge,
-  ConfirmDialog,
   Dialog,
   Field,
   Input,
@@ -39,7 +39,10 @@ export default function UsersPage() {
     queryFn: () => api<DirectoryEntry[]>("/users/directory"),
   });
 
-  const invalidate = () => client.invalidateQueries();
+  const invalidate = async () => {
+    await client.invalidateQueries({ queryKey: ["users"] });
+    await client.invalidateQueries({ queryKey: ["directory"] });
+  };
 
   const toggleActive = useMutation({
     mutationFn: (target: User) =>
@@ -59,11 +62,18 @@ export default function UsersPage() {
   });
 
   const resetPassword = useMutation({
-    mutationFn: (target: User) =>
-      api<CreatedUser>(`/users/${target.id}/reset-password`, { method: "POST", json: {} }),
-    onSuccess: async (result) => {
-      setIssued({ name: result.full_name, password: result.temporary_password });
+    mutationFn: ({ target, newPassword }: { target: User; newPassword: string }) =>
+      api<CreatedUser>(`/users/${target.id}/reset-password`, {
+        method: "POST",
+        json: newPassword.trim() ? { new_password: newPassword.trim() } : {},
+      }),
+    onSuccess: async (result, variables) => {
       setResetting(null);
+      if (variables.newPassword.trim()) {
+        toast.success(`Password updated for ${result.full_name}`);
+      } else {
+        setIssued({ name: result.full_name, password: result.temporary_password });
+      }
       await invalidate();
     },
     onError: (error) =>
@@ -79,6 +89,11 @@ export default function UsersPage() {
     );
   }
 
+  const allUsers = users.data ?? [];
+  const activeCount = allUsers.filter((u) => u.is_active).length;
+  const adminCount = allUsers.filter((u) => u.is_admin).length;
+  const reviewerCount = allUsers.filter((u) => u.can_review).length;
+
   return (
     <>
       <PageHeader
@@ -87,10 +102,57 @@ export default function UsersPage() {
         actions={
           <Button onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" aria-hidden />
-            New user
+            New User
           </Button>
         }
       />
+
+      {/* Summary KPI Strip */}
+      <div className="mb-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="flex items-center justify-between rounded-2xl p-5 hero-green-card shadow-[0_8px_24px_rgba(20,83,56,0.18)]">
+          <div>
+            <p className="text-xs font-medium text-white/85">Total Accounts</p>
+            <p className="mt-1 tabular text-3xl font-bold text-white">{allUsers.length}</p>
+            <p className="mt-1 text-xs text-[#a9dfc2]">{activeCount} currently active</p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white/15 text-white">
+            <Users className="h-5 w-5" aria-hidden />
+          </span>
+        </div>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Active Members</p>
+            <p className="mt-1 tabular text-3xl font-bold text-foreground">{activeCount}</p>
+            <p className="mt-1 text-xs text-[#1f7a52]">Can sign in & track time</p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <CheckCircle2 className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Administrators</p>
+            <p className="mt-1 tabular text-3xl font-bold text-foreground">{adminCount}</p>
+            <p className="mt-1 text-xs text-muted-foreground">Manage users & permissions</p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <ShieldCheck className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Reviewers</p>
+            <p className="mt-1 tabular text-3xl font-bold text-foreground">{reviewerCount}</p>
+            <p className="mt-1 text-xs text-muted-foreground">Can approve work</p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <KeyRound className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
+      </div>
 
       {users.isLoading ? (
         <Spinner label="Loading users" />
@@ -100,43 +162,50 @@ export default function UsersPage() {
           onRetry={() => void users.refetch()}
         />
       ) : (
-        <Card>
-          <CardContent className="p-0">
+        <Card className="overflow-hidden">
+          <CardContent className="overflow-x-auto p-0">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-4 py-3 font-medium">Name</th>
-                  <th className="px-4 py-3 font-medium">Email</th>
-                  <th className="px-4 py-3 font-medium">Role</th>
-                  <th className="px-4 py-3 font-medium">Flags</th>
-                  <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3" />
+                <tr className="border-b border-border/70 bg-muted/30 text-left text-xs uppercase tracking-wider text-muted-foreground">
+                  <th className="px-5 py-3.5 font-semibold">Person</th>
+                  <th className="px-4 py-3.5 font-semibold">Username</th>
+                  <th className="px-4 py-3.5 font-semibold">Role</th>
+                  <th className="px-4 py-3.5 font-semibold">Flags</th>
+                  <th className="px-4 py-3.5 font-semibold">Status</th>
+                  <th className="px-5 py-3.5" />
                 </tr>
               </thead>
-              <tbody>
-                {users.data!.map((row) => (
-                  <tr key={row.id} className="border-b border-border last:border-b-0">
-                    <td className="px-4 py-3 font-medium">
-                      {row.full_name}
-                      {row.id === me?.id ? (
-                        <span className="ml-2 text-xs text-muted-foreground">(you)</span>
-                      ) : null}
+              <tbody className="divide-y divide-border/70">
+                {allUsers.map((row) => (
+                  <tr key={row.id} className="transition-colors hover:bg-muted/25">
+                    <td className="px-5 py-3.5 font-semibold">
+                      <div className="flex items-center gap-3">
+                        <Avatar person={row} size="sm" />
+                        <span>
+                          {row.full_name}
+                          {row.id === me?.id ? (
+                            <span className="ml-2 rounded-full bg-[#eaf4ef] px-2 py-0.5 text-[10px] font-semibold text-[#145338]">
+                              you
+                            </span>
+                          ) : null}
+                        </span>
+                      </div>
                     </td>
-                    <td className="px-4 py-3 text-muted-foreground">{row.email}</td>
-                    <td className="px-4 py-3">
+                    <td className="px-4 py-3.5 font-mono text-xs text-muted-foreground">
+                      {row.email}
+                    </td>
+                    <td className="px-4 py-3.5">
                       <RoleSelect user={row} onDone={invalidate} />
                     </td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-wrap gap-1">
+                    <td className="px-4 py-3.5">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         {row.is_admin ? <Badge variant="default">admin</Badge> : null}
                         {row.can_review ? <Badge variant="outline">can review</Badge> : null}
-                        {!row.is_admin ? (
-                          <FlagToggle user={row} field="is_admin" onDone={invalidate} />
-                        ) : null}
+                        <FlagToggle user={row} field="is_admin" onDone={invalidate} />
                         <FlagToggle user={row} field="can_review" onDone={invalidate} />
                       </div>
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-4 py-3.5">
                       {row.is_active ? (
                         <Badge variant="success">Active</Badge>
                       ) : (
@@ -148,21 +217,21 @@ export default function UsersPage() {
                         </Badge>
                       ) : null}
                     </td>
-                    <td className="px-4 py-3">
-                      <div className="flex justify-end gap-1">
-                        <Button variant="ghost" size="sm" onClick={() => setResetting(row)}>
-                          <KeyRound className="h-4 w-4" aria-hidden />
+                    <td className="px-5 py-3.5">
+                      <div className="flex justify-end gap-1.5">
+                        <Button variant="outline" size="sm" onClick={() => setResetting(row)}>
+                          <KeyRound className="h-3.5 w-3.5" aria-hidden />
                           Reset
                         </Button>
                         {row.id !== me?.id ? (
                           row.is_active ? (
                             <Button variant="ghost" size="sm" onClick={() => setDeactivating(row)}>
-                              <UserMinus className="h-4 w-4" aria-hidden />
+                              <UserMinus className="h-3.5 w-3.5" aria-hidden />
                               Deactivate
                             </Button>
                           ) : (
                             <Button
-                              variant="ghost"
+                              variant="outline"
                               size="sm"
                               onClick={() => toggleActive.mutate(row)}
                               loading={toggleActive.isPending}
@@ -188,15 +257,15 @@ export default function UsersPage() {
         onIssued={(name, password) => setIssued({ name, password })}
       />
 
-      <ConfirmDialog
-        open={resetting !== null}
-        onClose={() => setResetting(null)}
-        confirmLabel="Reset password"
-        title={`Reset the password for ${resetting?.full_name ?? ""}?`}
-        description="All their sessions end immediately and they must choose a new password at next sign-in."
-        loading={resetPassword.isPending}
-        onConfirm={() => resetting && resetPassword.mutate(resetting)}
-      />
+      {resetting ? (
+        <ResetPasswordDialog
+          key={resetting.id}
+          user={resetting}
+          loading={resetPassword.isPending}
+          onClose={() => setResetting(null)}
+          onSubmit={(newPassword) => resetPassword.mutate({ target: resetting, newPassword })}
+        />
+      ) : null}
 
       <DeactivateDialog
         user={deactivating}
@@ -241,7 +310,7 @@ function RoleSelect({ user, onDone }: { user: User; onDone: () => void }) {
 
   return (
     <Select
-      className="h-8 w-auto text-xs"
+      className="h-8 w-auto rounded-full px-3 text-xs"
       value={user.role}
       disabled={mutation.isPending}
       onChange={(e) => mutation.mutate(e.target.value as Role)}
@@ -272,15 +341,30 @@ function FlagToggle({
       toast.error(error instanceof ApiError ? error.message : "Could not update the flag"),
   });
 
+  const granted = Boolean(user[field]);
   const label = field === "is_admin" ? "admin" : "review";
   return (
     <button
       type="button"
       disabled={mutation.isPending}
-      onClick={() => mutation.mutate(!user[field])}
-      className="rounded-full border border-dashed border-border px-2 py-0.5 text-xs text-muted-foreground hover:border-primary hover:text-primary disabled:opacity-50"
+      onClick={() => mutation.mutate(!granted)}
+      title={granted ? `Remove ${label} rights` : `Grant ${label} rights`}
+      aria-label={
+        field === "is_admin"
+          ? granted
+            ? `Remove admin rights from ${user.full_name}`
+            : `Make ${user.full_name} an admin`
+          : granted
+            ? `Remove review rights from ${user.full_name}`
+            : `Let ${user.full_name} review work`
+      }
+      className={`rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors disabled:opacity-50 ${
+        granted
+          ? "border-border text-muted-foreground hover:border-destructive hover:text-destructive"
+          : "border-dashed border-border text-muted-foreground hover:border-[#145338] hover:text-[#145338]"
+      }`}
     >
-      + {label}
+      {granted ? `− ${label}` : `+ ${label}`}
     </button>
   );
 }
@@ -296,18 +380,15 @@ function CreateUserDialog({
   onDone: () => void;
   onIssued: (name: string, password: string | null) => void;
 }) {
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [fullName, setFullName] = useState("");
   const [role, setRole] = useState<Role>("member");
   const [isAdmin, setIsAdmin] = useState(false);
   const [canReview, setCanReview] = useState(false);
   const [password, setPassword] = useState("");
 
-  // This dialog stays mounted between opens, so every field must be cleared on
-  // the way out. Otherwise dismissing it with the admin flag ticked silently
-  // makes the next user created an admin.
   const clearForm = () => {
-    setEmail("");
+    setUsername("");
     setFullName("");
     setRole("member");
     setIsAdmin(false);
@@ -324,7 +405,7 @@ function CreateUserDialog({
       api<CreatedUser>("/users", {
         method: "POST",
         json: {
-          email: email.trim(),
+          email: username.trim(),
           full_name: fullName.trim(),
           role,
           is_admin: isAdmin,
@@ -336,7 +417,9 @@ function CreateUserDialog({
       toast.success(`Created ${created.full_name}`);
       clearForm();
       onClose();
-      onIssued(created.full_name, created.temporary_password);
+      if (created.temporary_password) {
+        onIssued(created.full_name, created.temporary_password);
+      }
       await onDone();
     },
     onError: (error) =>
@@ -348,7 +431,7 @@ function CreateUserDialog({
       open={open}
       onClose={handleClose}
       title="Create a user"
-      description="Leave the password blank to generate a temporary one, shown once."
+      description="Enter a username and optional password (or leave password blank to generate a temporary one)."
       footer={
         <>
           <Button variant="outline" onClick={handleClose}>
@@ -357,7 +440,7 @@ function CreateUserDialog({
           <Button
             onClick={() => mutation.mutate()}
             loading={mutation.isPending}
-            disabled={!email.trim() || !fullName.trim()}
+            disabled={!username.trim() || !fullName.trim()}
           >
             Create
           </Button>
@@ -368,8 +451,13 @@ function CreateUserDialog({
         <Field label="Full name">
           <Input value={fullName} onChange={(e) => setFullName(e.target.value)} maxLength={200} />
         </Field>
-        <Field label="Email">
-          <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <Field label="Username">
+          <Input
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="e.g. alex or superadmin"
+          />
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="Role">
@@ -399,6 +487,50 @@ function CreateUserDialog({
           Can review and approve work
         </label>
       </div>
+    </Dialog>
+  );
+}
+
+function ResetPasswordDialog({
+  user,
+  loading,
+  onClose,
+  onSubmit,
+}: {
+  user: User;
+  loading: boolean;
+  onClose: () => void;
+  onSubmit: (newPassword: string) => void;
+}) {
+  const [newPassword, setNewPassword] = useState("");
+  const tooShort = newPassword.trim().length > 0 && newPassword.trim().length < 10;
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={`Reset password for ${user.full_name}`}
+      description="Enter a new password directly (10+ characters), or leave blank to generate a one-time temporary password."
+      onSubmit={() => {
+        if (tooShort) return;
+        onSubmit(newPassword);
+      }}
+      submitLabel={newPassword.trim() ? "Save new password" : "Generate temporary password"}
+      submitting={loading}
+    >
+      <Field
+        label="New password (optional)"
+        hint="If you set a password here, it takes effect immediately without requiring a password change at login."
+        error={tooShort ? "Password must be at least 10 characters" : undefined}
+      >
+        <Input
+          type="text"
+          autoFocus
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
+          placeholder="Leave blank to auto-generate temporary password"
+        />
+      </Field>
     </Dialog>
   );
 }
@@ -458,6 +590,20 @@ function IssuedPasswordDialog({
   issued: { name: string; password: string | null } | null;
   onClose: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
+
+  const copyPassword = async () => {
+    if (!issued?.password) return;
+    try {
+      await navigator.clipboard.writeText(issued.password);
+      setCopied(true);
+      toast.success("Temporary password copied to clipboard");
+      setTimeout(() => setCopied(false), 2500);
+    } catch {
+      toast.error("Could not copy automatically — please select and copy the text");
+    }
+  };
+
   return (
     <Dialog
       open={issued !== null}
@@ -465,15 +611,25 @@ function IssuedPasswordDialog({
       title="Temporary password"
       description="This is shown once. Copy it now — it cannot be retrieved later."
       footer={
-        <Button onClick={onClose}>Done</Button>
+        <div className="flex w-full items-center justify-end gap-2">
+          <Button variant="outline" onClick={() => void copyPassword()}>
+            {copied ? <Check className="h-4 w-4 text-[#145338]" /> : <Copy className="h-4 w-4" />}
+            {copied ? "Copied" : "Copy password"}
+          </Button>
+          <Button onClick={onClose}>Done</Button>
+        </div>
       }
     >
-      <div className="rounded-md border border-border bg-muted p-4">
-        <p className="text-sm font-medium">{issued?.name}</p>
-        <code className="mt-1 block break-all text-sm">{issued?.password}</code>
+      <div className="rounded-xl border border-[#1f7a52]/30 bg-[#eaf4ef]/50 p-4">
+        <p className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+          Account: {issued?.name}
+        </p>
+        <code className="mt-1.5 block select-all break-all font-mono text-base font-bold text-[#145338]">
+          {issued?.password}
+        </code>
       </div>
       <p className="mt-3 text-xs text-muted-foreground">
-        They must change it at first sign-in. Existing sessions were signed out.
+        Share this temporary password with the user. Other active sessions for this user were signed out.
       </p>
     </Dialog>
   );

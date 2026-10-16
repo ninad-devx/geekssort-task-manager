@@ -89,25 +89,23 @@ export function TimerBar() {
   };
 
   return (
-    <div className="sticky bottom-0 z-30 border-t border-border bg-card/95 backdrop-blur">
-      <div className="mx-auto max-w-7xl px-4 py-2.5">
-        {running.length > 1 ? (
-          <p className="pb-1 text-xs text-muted-foreground">
-            {running.length} timers running at once
-          </p>
-        ) : null}
-        <ul className="flex flex-col gap-1">
-          {running.map((timer) => (
-            <TimerLine
-              key={timer.log_id}
-              timer={timer}
-              serverTime={data?.server_time}
-              onPause={() => void pause(timer.log_id)}
-              pausing={pausing === timer.log_id}
-            />
-          ))}
-        </ul>
-      </div>
+    <div className="sticky bottom-3 z-30 rounded-2xl border border-[#145338]/20 bg-card/95 px-5 py-3 shadow-lg backdrop-blur">
+      {running.length > 1 ? (
+        <p className="pb-1 text-xs text-muted-foreground">
+          {running.length} timers running at once
+        </p>
+      ) : null}
+      <ul className="flex flex-col gap-1.5">
+        {running.map((timer) => (
+          <TimerLine
+            key={timer.log_id}
+            timer={timer}
+            serverTime={data?.server_time}
+            onPause={() => void pause(timer.log_id)}
+            pausing={pausing === timer.log_id}
+          />
+        ))}
+      </ul>
     </div>
   );
 }

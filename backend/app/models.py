@@ -172,6 +172,22 @@ class SessionRow(Base):
     user: Mapped[User] = relationship(back_populates="sessions")
 
 
+class LoginAttempt(Base):
+    """One failed sign-in, kept so the throttle survives a restart and works
+    across workers. An in-memory dict did neither: it reset on every deploy and
+    grew without bound.
+
+    `scope` is either `email:<address>` or `ip:<address>`, so one query counts
+    either bucket. Rows older than the window are pruned on the next attempt.
+    """
+
+    __tablename__ = "login_attempts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(330), index=True)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
 # --- tasks -----------------------------------------------------------------
 
 class Task(Base):
@@ -256,12 +272,17 @@ class WorkSession(Base):
         # task. Previously this was one running timer per person; that made
         # switching tasks destroy the previous session, which is exactly the
         # friction multi-task work hit.
+        #
+        # `deleted_at IS NULL` is part of the predicate on purpose. Discarding a
+        # running entry soft-deletes the row, and without this clause the
+        # deleted row kept holding the slot: the next start on that task died on
+        # a UNIQUE violation and the task could never be tracked again.
         Index(
             "uq_running_session_per_user_task",
             "user_id",
             "task_id",
             unique=True,
-            sqlite_where=text("ended_at IS NULL"),
+            sqlite_where=text("ended_at IS NULL AND deleted_at IS NULL"),
         ),
     )
 
@@ -311,14 +332,19 @@ class Folder(Base):
 
     parent: Mapped["Folder | None"] = relationship(remote_side=[id])
 
-
-Index(
-    "uq_folder_sibling_name",
-    "parent_id",
-    "name",
-    unique=True,
-    sqlite_where=text("deleted_at IS NULL"),
-)
+    # Declared here, not at module level. A module-level `Index` built from
+    # plain strings has no owning Table, so SQLAlchemy never emits it and
+    # `create_all` silently skipped it -- the sibling-name guarantee was only
+    # ever enforced by an application check.
+    __table_args__ = (
+        Index(
+            "uq_folder_sibling_name",
+            "parent_id",
+            "name",
+            unique=True,
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
 
 
 class ResourceLink(Base):

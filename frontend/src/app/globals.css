@@ -1,26 +1,29 @@
 @import "tailwindcss";
 
 @theme {
-  --color-background: oklch(0.99 0.002 250);
-  --color-foreground: oklch(0.21 0.02 265);
-  --color-card: oklch(1 0 0);
-  --color-card-foreground: oklch(0.21 0.02 265);
-  --color-muted: oklch(0.96 0.005 250);
-  --color-muted-foreground: oklch(0.52 0.02 265);
-  --color-primary: oklch(0.52 0.17 262);
-  --color-primary-foreground: oklch(0.99 0.002 250);
-  --color-secondary: oklch(0.96 0.008 250);
-  --color-secondary-foreground: oklch(0.28 0.02 265);
-  --color-muted-foreground-strong: oklch(0.38 0.02 265);
-  --color-destructive: oklch(0.58 0.21 27);
-  --color-destructive-foreground: oklch(0.99 0.002 250);
-  --color-success: oklch(0.6 0.14 155);
-  --color-warning: oklch(0.72 0.16 70);
-  --color-border: oklch(0.91 0.005 250);
-  --color-input: oklch(0.91 0.005 250);
-  --color-ring: oklch(0.52 0.17 262);
+  --color-background: #f5f6f7;
+  --color-foreground: #11181c;
+  --color-card: #ffffff;
+  --color-card-foreground: #11181c;
+  --color-muted: #f2f4f5;
+  --color-muted-foreground: #687076;
+  --color-primary: #145338;
+  --color-primary-foreground: #ffffff;
+  --color-emerald: #1f7a52;
+  --color-emerald-light: #4db380;
+  --color-emerald-tint: #eaf4ef;
+  --color-secondary: #f1f3f5;
+  --color-secondary-foreground: #1e293b;
+  --color-muted-foreground-strong: #475569;
+  --color-destructive: #e5484d;
+  --color-destructive-foreground: #ffffff;
+  --color-success: #1f7a52;
+  --color-warning: #d97706;
+  --color-border: #eceef0;
+  --color-input: #e2e8f0;
+  --color-ring: #145338;
 
-  --radius: 0.5rem;
+  --radius: 1rem;
 }
 
 @layer base {
@@ -38,7 +41,7 @@
   /* Distributions are CSS stacked bars (5.2: no chart library). */
   .stacked-bar {
     display: flex;
-    height: 0.5rem;
+    height: 0.625rem;
     width: 100%;
     overflow: hidden;
     border-radius: 9999px;
@@ -50,5 +53,34 @@
   }
   .tabular {
     font-variant-numeric: tabular-nums;
+  }
+  .striped-bar {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      rgba(20, 83, 56, 0.28) 0px,
+      rgba(20, 83, 56, 0.28) 3px,
+      transparent 3px,
+      transparent 8px
+    );
+    background-color: #f8faf9;
+    border: 1px solid rgba(20, 83, 56, 0.16);
+  }
+  .hero-green-card {
+    background: linear-gradient(145deg, #10452e 0%, #196444 55%, #22845a 100%);
+    color: #ffffff;
+  }
+  .time-tracker-card {
+    background:
+      radial-gradient(circle at 85% 20%, rgba(77, 179, 128, 0.28) 0%, transparent 55%),
+      radial-gradient(circle at 15% 85%, rgba(31, 122, 82, 0.35) 0%, transparent 60%),
+      repeating-radial-gradient(
+        circle at 110% 110%,
+        rgba(255, 255, 255, 0.04) 0px,
+        rgba(255, 255, 255, 0.04) 2px,
+        transparent 2px,
+        transparent 14px
+      ),
+      linear-gradient(155deg, #072216 0%, #0d3825 55%, #145338 100%);
+    color: #ffffff;
   }
 }

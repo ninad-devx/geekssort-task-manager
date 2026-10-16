@@ -102,6 +102,11 @@ export interface RunningTimer {
   started_at: string;
   elapsed_seconds: number;
   is_stale: boolean;
+  /** Who the timer belongs to. Without this a client cannot tell its own clock
+   *  -- the only one it may pause -- from a colleague's. */
+  user_id: number;
+  user: Actor | null;
+  is_mine: boolean;
 }
 
 export interface Task {
@@ -130,6 +135,8 @@ export interface Task {
   is_overdue: boolean;
   tracked_seconds: number;
   running: RunningTimer | null;
+  /** Timers other people have open on this task. */
+  other_runners: RunningTimer[];
   allowed_actions: string[];
   log_count: number;
 }

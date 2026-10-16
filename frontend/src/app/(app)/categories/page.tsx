@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, RotateCcw, Trash2 } from "lucide-react";
+import { CheckCircle2, FolderKanban, Layers, Pencil, Plus, RotateCcw, Sparkles, Tag, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 
@@ -99,6 +99,11 @@ export default function CategoriesPage() {
     );
   }
 
+  const allCategories = categories.data;
+  const activeCount = allCategories.filter((c) => c.is_active).length;
+  const retiredCount = allCategories.length - activeCount;
+  const totalCategorizedTasks = allCategories.reduce((sum, c) => sum + c.task_count, 0);
+
   return (
     <>
       <PageHeader
@@ -112,18 +117,78 @@ export default function CategoriesPage() {
         }
       />
 
+      {/* KPI Summary Cards */}
+      <div className="mb-5 grid gap-3.5 sm:grid-cols-3">
+        <div className="hero-green-card relative overflow-hidden rounded-2xl p-4 shadow-sm">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs font-medium text-white/80">Total Categories</p>
+              <p className="tabular mt-1.5 text-2xl font-bold tracking-tight text-white">
+                {allCategories.length}
+              </p>
+            </div>
+            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/15 text-white">
+              <Tag className="h-4 w-4" aria-hidden />
+            </span>
+          </div>
+          <p className="mt-2 text-[11px] font-medium text-white/75">
+            {retiredCount > 0 ? `${retiredCount} retired from pickers` : "All categories currently active"}
+          </p>
+        </div>
+
+        <div className="rounded-2xl border border-border/70 bg-card p-4 shadow-[0_1px_3px_rgba(15,23,42,0.03)]">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs font-medium text-muted-foreground">Active in Pickers</p>
+              <p className="tabular mt-1.5 text-2xl font-bold tracking-tight text-foreground">
+                {activeCount}
+              </p>
+            </div>
+            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-[#eaf4ef] text-[#145338]">
+              <CheckCircle2 className="h-4 w-4" aria-hidden />
+            </span>
+          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            Available when creating or editing tasks
+          </p>
+        </div>
+
+        <div className="rounded-2xl border border-border/70 bg-card p-4 shadow-[0_1px_3px_rgba(15,23,42,0.03)]">
+          <div className="flex items-start justify-between">
+            <div>
+              <p className="text-xs font-medium text-muted-foreground">Tasks Categorized</p>
+              <p className="tabular mt-1.5 text-2xl font-bold tracking-tight text-foreground">
+                {totalCategorizedTasks}
+              </p>
+            </div>
+            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-[#eaf4ef] text-[#145338]">
+              <FolderKanban className="h-4 w-4" aria-hidden />
+            </span>
+          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            Total tasks linked across categories
+          </p>
+        </div>
+      </div>
+
       {adding ? (
-        <Card className="mb-4">
-          <div className="flex gap-2 p-3">
-            <Input
-              autoFocus
-              placeholder="e.g. Paid social"
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && label.trim()) create.mutate();
-              }}
-            />
+        <div className="mb-4 rounded-2xl border border-[#1f7a52]/20 bg-gradient-to-r from-[#eaf4ef]/60 via-white to-white p-3.5 shadow-[0_1px_3px_rgba(15,23,42,0.03)]">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#145338] text-white shadow-xs">
+              <Sparkles className="h-4 w-4" aria-hidden />
+            </div>
+            <div className="min-w-[200px] flex-1">
+              <Input
+                autoFocus
+                placeholder="New category label — e.g. Paid social"
+                value={label}
+                onChange={(e) => setLabel(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && label.trim()) create.mutate();
+                }}
+                className="border-transparent bg-white/90 shadow-xs focus:border-[#1f7a52]"
+              />
+            </div>
             <Button
               disabled={!label.trim()}
               loading={create.isPending}
@@ -132,15 +197,26 @@ export default function CategoriesPage() {
               Add
             </Button>
           </div>
-        </Card>
+        </div>
       ) : null}
 
-      {categories.data.length === 0 ? (
+      {allCategories.length === 0 ? (
         <EmptyState title="No categories" description="Add one to get started." />
       ) : (
-        <Card>
-          <ul>
-            {categories.data.map((row) => (
+        <Card className="overflow-hidden">
+          <div className="flex items-center justify-between border-b border-border/60 bg-muted/20 px-5 py-3">
+            <div className="flex items-center gap-2">
+              <Layers className="h-4 w-4 text-[#145338]" aria-hidden />
+              <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                Category Directory ({allCategories.length})
+              </span>
+            </div>
+            <span className="text-xs text-muted-foreground">
+              Slugs remain immutable so historical task filters never break
+            </span>
+          </div>
+          <ul className="divide-y divide-border/60">
+            {allCategories.map((row) => (
               <CategoryRow
                 key={row.slug}
                 row={row}
@@ -189,7 +265,7 @@ function CategoryRow({
 
   if (editing) {
     return (
-      <li className="flex items-center gap-2 border-b border-border px-4 py-3 last:border-b-0">
+      <li className="flex items-center gap-2.5 bg-[#eaf4ef]/30 px-5 py-3.5">
         <Input
           autoFocus
           value={value}
@@ -220,29 +296,46 @@ function CategoryRow({
   }
 
   return (
-    <li className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
-      <span className="min-w-0 flex-1">
-        <span className={row.is_active ? "" : "text-muted-foreground line-through"}>
-          {row.label}
-        </span>
-        <span className="ml-2 text-xs text-muted-foreground">{row.slug}</span>
-      </span>
-      <Badge variant="muted">
+    <li className="flex flex-wrap items-center gap-3 px-5 py-3.5 transition-colors hover:bg-muted/25">
+      <div
+        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${
+          row.is_active ? "bg-[#eaf4ef] text-[#145338]" : "bg-muted text-muted-foreground"
+        }`}
+      >
+        <Tag className="h-4 w-4" aria-hidden />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`text-sm font-semibold ${
+              row.is_active ? "text-foreground" : "text-muted-foreground line-through"
+            }`}
+          >
+            {row.label}
+          </span>
+          <span className="rounded-md bg-muted/70 px-2 py-0.5 font-mono text-[11px] text-muted-foreground">
+            {row.slug}
+          </span>
+          {!row.is_active ? <Badge variant="muted">Retired</Badge> : null}
+        </div>
+      </div>
+      <Badge variant={row.task_count > 0 ? "default" : "muted"}>
         {row.task_count} task{row.task_count === 1 ? "" : "s"}
       </Badge>
       {row.is_active ? (
-        <>
+        <div className="flex items-center gap-1">
           <Button size="sm" variant="ghost" disabled={busy} onClick={() => setEditing(true)}>
+            <Pencil className="h-3.5 w-3.5" aria-hidden />
             Rename
           </Button>
           <Button size="sm" variant="ghost" disabled={busy} onClick={onRetire}>
-            <Trash2 className="h-4 w-4" aria-hidden />
+            <Trash2 className="h-3.5 w-3.5 text-destructive" aria-hidden />
             Retire
           </Button>
-        </>
+        </div>
       ) : (
-        <Button size="sm" variant="ghost" disabled={busy} onClick={onRestore}>
-          <RotateCcw className="h-4 w-4" aria-hidden />
+        <Button size="sm" variant="outline" disabled={busy} onClick={onRestore}>
+          <RotateCcw className="h-3.5 w-3.5" aria-hidden />
           Restore
         </Button>
       )}

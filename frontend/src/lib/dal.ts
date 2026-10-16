@@ -10,6 +10,17 @@ const API_ORIGIN = process.env.API_ORIGIN ?? "http://127.0.0.1:8000";
 const COOKIE_NAME = process.env.SESSION_COOKIE ?? "mos_session";
 
 /**
+ * The API could not be reached at all -- it is down, or the network between us
+ * and it is. This is deliberately not the same as "not signed in".
+ */
+export class ApiUnavailableError extends Error {
+  constructor(message = "The server is not responding") {
+    super(message);
+    this.name = "ApiUnavailableError";
+  }
+}
+
+/**
  * Data Access Layer. The session cookie is HttpOnly (D-01) so it cannot be read by
  * page scripts; it is read here on the server and forwarded to the API, which is the
  * only component that can validate it.
@@ -18,16 +29,26 @@ async function fetchSession(): Promise<SessionInfo | null> {
   const token = (await cookies()).get(COOKIE_NAME)?.value;
   if (!token) return null;
 
+  let response: Response;
   try {
-    const response = await fetch(`${API_ORIGIN}/api/auth/me`, {
+    response = await fetch(`${API_ORIGIN}/api/auth/me`, {
       headers: { cookie: `${COOKIE_NAME}=${token}`, accept: "application/json" },
       cache: "no-store",
     });
-    if (!response.ok) return null;
-    return (await response.json()) as SessionInfo;
   } catch {
-    // The API being unreachable is not a reason to hang on a spinner.
-    return null;
+    // Previously this returned null, which `requireSession` read as "signed
+    // out" and redirected to /login. An outage therefore logged the entire
+    // company out with no explanation, and signing back in failed too.
+    throw new ApiUnavailableError();
+  }
+  if (!response.ok) return null;
+
+  const text = await response.text();
+  try {
+    return JSON.parse(text) as SessionInfo;
+  } catch {
+    // A 200 that is not a session means something answered instead of the API.
+    throw new ApiUnavailableError("The server sent a response this app could not read");
   }
 }
 

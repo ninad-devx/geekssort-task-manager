@@ -55,14 +55,23 @@ export function ChangePasswordForm({ user, appTimezone }: { user: User; appTimez
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-secondary/40 px-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-sm">
-        <h1 className="text-lg font-semibold">
+    <div className="flex min-h-screen items-center justify-center bg-[#eceef0]/60 px-4">
+      <div className="w-full max-w-sm rounded-3xl border border-border/80 bg-card p-7 shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+        <div className="mb-4 flex items-center gap-2.5">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/logo.png"
+            alt="Taskssort logo"
+            className="h-9 w-9 shrink-0 rounded-full object-contain"
+          />
+          <span className="text-base font-bold tracking-tight">Taskssort</span>
+        </div>
+        <h1 className="text-xl font-bold tracking-tight">
           {forced ? "Choose a new password" : "Change your password"}
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
           {forced
-            ? "You must set a new password before you can use MarketingOS."
+            ? "You must set a new password before you can use Taskssort."
             : `Signed in as ${user.full_name} · ${user.email}`}
         </p>
 

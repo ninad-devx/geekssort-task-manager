@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="MarketingOS API",
+    title="Taskssort API",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/api/docs",

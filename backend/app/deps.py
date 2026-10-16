@@ -109,6 +109,16 @@ def require_admin(current: CurrentUser = Depends(get_current_user)) -> CurrentUs
 
 
 def client_ip(request: Request) -> str:
+    """The address the throttle keys on.
+
+    `X-Forwarded-For` is only honoured when the deployment says a proxy is in
+    front. Trusting it unconditionally would let any client announce a fresh
+    address on every request and walk straight through the login limit.
+    """
+    if settings.TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()[:64]
     return (request.client.host if request.client else "unknown")
 
 

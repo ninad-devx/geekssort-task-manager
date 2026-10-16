@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app import policy, timelog
+from app import aggregate, policy, timelog
 from app.db import get_db, write_tx
 from app.deps import CurrentUser, get_current_user
 from app.errors import forbidden, not_found
@@ -103,20 +103,22 @@ def current_timer(current: CurrentUser = Depends(get_current_user), db: Session 
     rows = running_sessions_for_user(db, current.user.id)
     if not rows:
         return {"running": [], "server_time": utcnow()}
-    return {
-        "running": [
+    out = []
+    for log in rows:
+        task = db.get(Task, log.task_id)
+        out.append(
             {
                 "log_id": log.id,
                 "task_id": log.task_id,
-                "task_title": (db.get(Task, log.task_id).title if db.get(Task, log.task_id) else "Task"),
+                "task_title": task.title if task else "Task",
                 "started_at": log.started_at,
                 "elapsed_seconds": elapsed(log),
                 "is_stale": is_stale(log),
+                "user_id": log.user_id,
+                "is_mine": True,
             }
-            for log in rows
-        ],
-        "server_time": utcnow(),
-    }
+        )
+    return {"running": out, "server_time": utcnow()}
 
 
 # --- time reporting ---------------------------------------------------------
@@ -133,7 +135,8 @@ def time_summary(
     An employee sees only their own hours. A CEO or team lead sees everyone's,
     which is what makes the company figure drillable: company -> person -> task.
     Raw per-timer rows stay on the task page; this is the summary people
-    actually read.
+    actually read. Time accruing on an open timer is included, so the figure
+    matches the clock rather than lagging until someone pauses.
     """
     from datetime import timedelta
 
@@ -164,7 +167,7 @@ def time_summary(
         select(
             WorkSession.user_id,
             WorkSession.task_id,
-            func.coalesce(func.sum(WorkSession.duration_seconds), 0),
+            func.coalesce(aggregate.live_seconds_expr(), 0),
             func.count(),
         )
         .join(Task, Task.id == WorkSession.task_id)
@@ -176,16 +179,22 @@ def time_summary(
     for uid, tid, seconds, count in rows:
         by_person.setdefault(uid, {})[tid] = (int(seconds or 0), int(count or 0))
 
+    # One lookup for every person and task referenced, not one per row.
+    user_ids = [uid for uid in by_person if uid is not None]
+    task_ids = {tid for tasks in by_person.values() for tid in tasks}
+    users_by_id = {u.id: u for u in db.scalars(select(User).where(User.id.in_(user_ids))).all()} if user_ids else {}
+    tasks_by_id = {t.id: t for t in db.scalars(select(Task).where(Task.id.in_(task_ids))).all()} if task_ids else {}
+
     people: list[TimePersonTotal] = []
-    for uid, tasks in sorted(by_person.items(), key=lambda kv: -sum(v[0] for v in kv[1].values())):
-        user = db.get(User, uid)
+    for uid, tasks in sorted(
+        by_person.items(), key=lambda kv: -sum(v[0] for v in kv[1].values())
+    ):
+        user = users_by_id.get(uid)
         if user is None:
             continue
         task_totals: list[TimeTaskTotal] = []
-        for tid, (seconds, count) in sorted(
-            tasks.items(), key=lambda kv: -kv[1][0]
-        ):
-            task = db.get(Task, tid)
+        for tid, (seconds, count) in sorted(tasks.items(), key=lambda kv: -kv[1][0]):
+            task = tasks_by_id.get(tid)
             if task is None:
                 continue
             task_totals.append(
@@ -245,7 +254,13 @@ def edit_log(log_id: int, payload: LogEditIn, current: CurrentUser = Depends(get
     with write_tx() as db:
         log = _load_log(current, db, log_id)
         if log.entry_type == EntryType.note.value:
-            payload = LogEditIn(**{**payload.model_dump(), "ended_at": None, "if_ended_at_unchanged": True})
+            # `exclude_unset` matters: a full `model_dump()` marks every field as
+            # present, so a note edit would also blank whatever the caller never
+            # mentioned.
+            data = payload.model_dump(exclude_unset=True)
+            data.pop("ended_at", None)
+            data["if_ended_at_unchanged"] = True
+            payload = LogEditIn(**data)
         updated = timelog.edit(db, log, current.user, payload)
         db.flush()
         return log_out(current.user, updated, db)

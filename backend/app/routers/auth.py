@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import time
-from collections import defaultdict, deque
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app import audit, policy
@@ -12,9 +11,10 @@ from app.config import settings
 from app.db import get_db, write_tx
 from app.deps import CurrentUser, client_ip, get_current_user
 from app.errors import unauthorized, unprocessable
-from app.models import EventType, SessionRow, User, utcnow
+from app.models import EventType, LoginAttempt, SessionRow, User, utcnow
 from app.schemas import ChangePasswordIn, LoginIn, SessionInfoOut, UserOut
 from app.security import (
+    escape_like,
     hash_password,
     new_session_token,
     session_expiry,
@@ -24,27 +24,62 @@ from app.security import (
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# FR-AUTH-003: in-memory, single worker (D-12)
-_failures: dict[tuple[str, str], deque] = defaultdict(deque)
+# FR-AUTH-003. The throttle lives in `login_attempts` rather than a module-level
+# dict: an in-memory bucket reset on every restart, counted per worker, and grew
+# without bound. It is also what lets one address be throttled regardless of how
+# many email addresses it sprays guesses across.
+_EMAIL_SCOPE = "email"
+_IP_SCOPE = "ip"
 
 
-def _check_rate_limit(email: str, ip: str) -> None:
-    key = (email.lower(), ip)
-    bucket = _failures[key]
-    now = time.time()
-    window = settings.LOGIN_FAIL_WINDOW_MINUTES * 60
-    while bucket and now - bucket[0] > window:
-        bucket.popleft()
-    if len(bucket) >= settings.LOGIN_FAIL_LIMIT:
+def _scopes(email: str, ip: str) -> tuple[str, str]:
+    return f"{_EMAIL_SCOPE}:{email.lower()}", f"{_IP_SCOPE}:{ip}"
+
+
+def _window_start():
+    return utcnow() - timedelta(minutes=settings.LOGIN_FAIL_WINDOW_MINUTES)
+
+
+def _prune(db: Session) -> None:
+    db.execute(delete(LoginAttempt).where(LoginAttempt.attempted_at < _window_start()))
+
+
+def _count(db: Session, scope: str) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(LoginAttempt)
+            .where(LoginAttempt.scope == scope, LoginAttempt.attempted_at >= _window_start())
+        )
+        or 0
+    )
+
+
+def _check_rate_limit(db: Session, email: str, ip: str) -> None:
+    email_scope, ip_scope = _scopes(email, ip)
+    if _count(db, email_scope) >= settings.LOGIN_FAIL_LIMIT:
         raise unauthorized("TOO_MANY_ATTEMPTS", "Too many failed attempts; try again later")
+    if _count(db, ip_scope) >= settings.LOGIN_FAIL_IP_LIMIT:
+        raise unauthorized(
+            "TOO_MANY_ATTEMPTS", "Too many failed attempts from this network; try again later"
+        )
 
 
-def _record_failure(email: str, ip: str) -> None:
-    _failures[(email.lower(), ip)].append(time.time())
+def _record_failure(db: Session, email: str, ip: str) -> None:
+    _prune(db)
+    now = utcnow()
+    for scope in _scopes(email, ip):
+        db.add(LoginAttempt(scope=scope, attempted_at=now))
 
 
-def _clear_failures(email: str, ip: str) -> None:
-    _failures.pop((email.lower(), ip), None)
+def _clear_failures(db: Session, email: str, ip: str) -> None:
+    """Clear only this account's bucket.
+
+    The address-wide bucket is deliberately left alone: otherwise signing in
+    once with a valid account — which an attacker often has — would wipe the
+    record of every guess they made against every other address.
+    """
+    db.execute(delete(LoginAttempt).where(LoginAttempt.scope == f"{_EMAIL_SCOPE}:{email.lower()}"))
 
 
 def _set_cookie(response: Response, token: str) -> None:
@@ -84,23 +119,36 @@ def session_info(user: User) -> SessionInfoOut:
 
 @router.post("/login", response_model=SessionInfoOut)
 def login(payload: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
-    email = payload.email.strip().lower()
+    identifier = (payload.username or payload.email or "").strip().lower()
+    if not identifier:
+        raise unauthorized("INVALID_CREDENTIALS", "Username or password is incorrect")
     ip = client_ip(request)
-    _check_rate_limit(email, ip)
+    _check_rate_limit(db, identifier, ip)
 
-    user = db.scalar(select(User).where(User.email == email))
+    user = db.scalar(select(User).where(func.lower(User.email) == identifier))
+    if user is None and "@" not in identifier:
+        user = db.scalar(
+            select(User).where(
+                (func.lower(User.display_name) == identifier)
+                | (func.lower(User.full_name) == identifier)
+                | (func.lower(User.email).like(f"{escape_like(identifier)}@%", escape="\\"))
+            )
+        )
     if user is None:
         from app.security import dummy_verify
 
         dummy_verify()
-        _record_failure(email, ip)
-        raise unauthorized("INVALID_CREDENTIALS", "Email or password is incorrect")
+        _record_failure(db, identifier, ip)
+        db.commit()
+        raise unauthorized("INVALID_CREDENTIALS", "Username or password is incorrect")
 
     if not verify_password(user.password_hash, payload.password) or not user.is_active:
-        _record_failure(email, ip)
-        raise unauthorized("INVALID_CREDENTIALS", "Email or password is incorrect")
+        _record_failure(db, identifier, ip)
+        db.commit()
+        raise unauthorized("INVALID_CREDENTIALS", "Username or password is incorrect")
 
-    _clear_failures(email, ip)
+    _clear_failures(db, identifier, ip)
+    _clear_failures(db, user.email, ip)
     now = utcnow()
     token, token_hash = new_session_token()
     idle_expires, absolute_expires = session_expiry(now)

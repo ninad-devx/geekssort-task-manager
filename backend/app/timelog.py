@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app import audit, policy
@@ -23,12 +23,6 @@ from app.models import (
     utcnow,
 )
 from app.security import validate_evidence_url
-
-
-def as_naive_utc(value: datetime) -> datetime:
-    if value.tzinfo is not None:
-        return value.astimezone(tz=None).replace(tzinfo=None)
-    return value
 
 
 def to_utc(value: datetime) -> datetime:
@@ -86,11 +80,15 @@ def validate_interval(
         )
 
     window_start, window_end = started_at, ended_at
+    # Only sessions that could possibly overlap are loaded. This used to read
+    # the person's entire time history on every manual entry and loop over it.
     candidates = db.scalars(
         select(WorkSession).where(
             WorkSession.user_id == user.id,
             WorkSession.deleted_at.is_(None),
             WorkSession.entry_type == EntryType.work_session.value,
+            WorkSession.started_at < window_end,
+            or_(WorkSession.ended_at.is_(None), WorkSession.ended_at > window_start),
         )
     ).all()
     for other in candidates:
@@ -129,61 +127,69 @@ def close_running_for_task(
     actor: User | None,
     reason: str,
 ) -> WorkSession | None:
-    log = db.scalar(
+    """Close every running timer on one task. Only the assignee can run a timer
+    on a task, so in practice there is at most one -- but closing all of them
+    keeps that from depending on it."""
+    logs = db.scalars(
         select(WorkSession).where(
             WorkSession.task_id == task.id,
             WorkSession.ended_at.is_(None),
             WorkSession.deleted_at.is_(None),
         )
-    )
-    if log is None:
-        return None
-    log.ended_at = now
-    log.duration_seconds = max(0, int((now - log.started_at).total_seconds()))
+    ).all()
+    closed = None
+    for log in logs:
+        log.ended_at = now
+        log.duration_seconds = max(0, int((now - log.started_at).total_seconds()))
+        closed = closed or log
+        audit.record(
+            db,
+            event_type=EventType.timer_paused.value,
+            entity_type="task_log",
+            entity_id=log.id,
+            task_id=task.id,
+            actor=actor if actor else log.user,
+            summary=f"Timer on “{task.title}” closed automatically ({reason})",
+            before={"ended_at": None},
+            after={"ended_at": now, "duration_seconds": log.duration_seconds},
+            meta={"auto": True, "reason": reason},
+            created_at=now,
+        )
     db.flush()
-    audit.record(
-        db,
-        event_type=EventType.timer_paused.value,
-        entity_type="task_log",
-        entity_id=log.id,
-        task_id=task.id,
-        actor=actor if actor else log.user,
-        summary=f"Timer on “{task.title}” closed automatically ({reason})",
-        before={"ended_at": None},
-        after={"ended_at": now, "duration_seconds": log.duration_seconds},
-        meta={"auto": True, "reason": reason},
-        created_at=now,
-    )
-    return log
+    return closed
 
 
 def close_running_for_user(db: Session, user_id: int, now: datetime, reason: str) -> None:
-    log = db.scalar(
+    """Close *every* timer this person had open.
+
+    Deactivating someone with three timers running used to close only the most
+    recent one; the other two kept ticking against a deactivated account.
+    """
+    logs = db.scalars(
         select(WorkSession).where(
             WorkSession.user_id == user_id,
             WorkSession.ended_at.is_(None),
             WorkSession.deleted_at.is_(None),
         )
-    )
-    if log is None:
-        return
-    task = db.get(Task, log.task_id)
-    log.ended_at = now
-    log.duration_seconds = max(0, int((now - log.started_at).total_seconds()))
+    ).all()
+    for log in logs:
+        task = db.get(Task, log.task_id)
+        log.ended_at = now
+        log.duration_seconds = max(0, int((now - log.started_at).total_seconds()))
+        audit.record(
+            db,
+            event_type=EventType.timer_paused.value,
+            entity_type="task_log",
+            entity_id=log.id,
+            task_id=log.task_id,
+            actor=task.assignee if task else None,
+            summary=f"Timer closed automatically ({reason})",
+            before={"ended_at": None},
+            after={"ended_at": now, "duration_seconds": log.duration_seconds},
+            meta={"auto": True, "reason": reason},
+            created_at=now,
+        )
     db.flush()
-    audit.record(
-        db,
-        event_type=EventType.timer_paused.value,
-        entity_type="task_log",
-        entity_id=log.id,
-        task_id=log.task_id,
-        actor=task.assignee if task else None,
-        summary=f"Timer closed automatically ({reason})",
-        before={"ended_at": None},
-        after={"ended_at": now, "duration_seconds": log.duration_seconds},
-        meta={"auto": True, "reason": reason},
-        created_at=now,
-    )
 
 
 # --- operations ------------------------------------------------------------
@@ -399,15 +405,20 @@ def add_manual(db: Session, task: Task, user: User, payload, now: datetime | Non
         ended_at = started_at + timedelta(minutes=payload.duration_minutes)
     if ended_at is None:
         raise unprocessable("ENDED_AT_REQUIRED", "Provide ended_at or duration_minutes")
-    ended_at = min(ended_at, now)
 
     err = validate_evidence_url(payload.evidence_url)
     if err:
         raise unprocessable("UNSAFE_URL", err)
 
-    validate_interval(db, user, started_at, ended_at, now=now)
+    # Order matters. `started_at` is checked first so a bad start gets the clear
+    # message rather than falling through to a confusing interval complaint.
+    # Clamping `ended_at` to `now` happened *before* this call, which made
+    # END_IN_FUTURE unreachable and silently shortened the entry instead of
+    # telling the person their requested window could not be honoured.
     if started_at > now:
         raise unprocessable("START_IN_FUTURE", "started_at cannot be in the future")
+
+    validate_interval(db, user, started_at, ended_at, now=now)
 
     log = WorkSession(
         task_id=task.id,
@@ -455,30 +466,48 @@ def edit(db: Session, log: WorkSession, user: User, payload, now: datetime | Non
     check_edit_window(log, now)
 
     is_running = log.ended_at is None
-    if is_running and log.deleted_at is None:
-        if payload.ended_at is not None and payload.if_ended_at_unchanged:
-            pass  # a running entry is closed only through Pause (FR-TIME-009)
-        if payload.ended_at is not None and not payload.if_ended_at_unchanged:
+    sent = payload.model_fields_set
+
+    if payload.ended_at is not None:
+        wanted = to_utc(payload.ended_at)
+        if is_running and log.deleted_at is None:
+            # FR-TIME-009: a running entry is closed only through Pause.
             raise conflict("USE_PAUSE", "Use the pause endpoint to close a running timer")
+        if payload.if_ended_at_unchanged and wanted != log.ended_at:
+            # The caller asserted it was not changing the end time but sent a
+            # different one. Swallowing that would lose the edit silently, so
+            # it is reported instead.
+            raise conflict(
+                "ENDED_AT_CONFLICT",
+                "This entry's end time would change; send if_ended_at_unchanged=false to apply it",
+            )
+        log.ended_at = wanted
 
     before = snapshot(log)
 
     if payload.started_at is not None:
         log.started_at = to_utc(payload.started_at)
-    if payload.note is not None:
+    # `model_fields_set` is what separates "left alone" from "explicitly
+    # cleared". Without it a note could be typed but never removed.
+    if "note" in sent:
         log.note = payload.note
     if payload.progress_percent is not None:
         log.progress_percent = payload.progress_percent
         task = db.get(Task, log.task_id)
         if task is not None:
             task.progress_percent = payload.progress_percent
-    if payload.evidence_url is not None:
+    if "evidence_url" in sent:
         err = validate_evidence_url(payload.evidence_url)
         if err:
             raise unprocessable("UNSAFE_URL", err)
         log.evidence_url = payload.evidence_url
 
-    if not is_running:
+    # A note is stamped `started_at == ended_at` with zero duration, so the
+    # interval rules below would reject every note edit with INVALID_INTERVAL.
+    # Notes have no interval to validate.
+    is_note = log.entry_type == EntryType.note.value
+
+    if not is_running and not is_note:
         if log.ended_at <= log.started_at:
             raise unprocessable("INVALID_INTERVAL", "ended_at must be after started_at")
         if int((log.ended_at - log.started_at).total_seconds()) > settings.MAX_SESSION_HOURS * 3600:
@@ -520,6 +549,14 @@ def delete(db: Session, log: WorkSession, user: User, now: datetime | None = Non
         return log
 
     snapshot_before = snapshot(log)
+    was_running = log.ended_at is None
+    if was_running:
+        # Discarding a running entry must close it. Leaving `ended_at` NULL
+        # meant the partial unique index kept holding the slot, so the next
+        # timer/start on that task died on a UNIQUE violation and the task
+        # could never be tracked again.
+        log.ended_at = now
+        log.duration_seconds = max(0, int((now - log.started_at).total_seconds()))
     log.deleted_at = now
     log.deleted_by_id = user.id
     db.flush()
@@ -532,9 +569,14 @@ def delete(db: Session, log: WorkSession, user: User, now: datetime | None = Non
         entity_id=log.id,
         task_id=log.task_id,
         actor=user,
-        summary=f"Time entry #{log.id} on “{task.title if task else 'a task'}” deleted",
+        summary=(
+            f"Running timer #{log.id} on “{task.title if task else 'a task'}” discarded"
+            if was_running
+            else f"Time entry #{log.id} on “{task.title if task else 'a task'}” deleted"
+        ),
         before=snapshot_before,
-        after={"deleted_at": now},
+        after={"deleted_at": now, "ended_at": log.ended_at},
+        meta={"was_running": was_running},
         created_at=now,
     )
     return log

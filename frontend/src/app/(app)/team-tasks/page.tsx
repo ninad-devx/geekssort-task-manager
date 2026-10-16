@@ -1,9 +1,18 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, Plus } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  FolderKanban,
+  Plus,
+  Search,
+  Users,
+} from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 
 import { PageHeader, roleLabel } from "@/components/app-shell";
 import { Avatar, displayName } from "@/components/avatar";
@@ -14,7 +23,7 @@ import { Card, CardContent, EmptyState, ErrorState, Spinner } from "@/components
 import { Badge, Input, Select } from "@/components/ui/form";
 import { api, ApiError, qs } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { formatDuration } from "@/lib/format";
+import { formatDuration, formatHours, todayLocal } from "@/lib/format";
 import {
   CATEGORY_LABELS,
   PRIORITY_LABELS,
@@ -34,7 +43,10 @@ function TeamTasksInner() {
 
   const [page, setPage] = useState(1);
   const [createOpen, setCreateOpen] = useState(false);
-  const [showDeleted, setShowDeleted] = useState(false);
+  // "off" | "with" (live + deleted) | "only" (deleted alone). `include_deleted`
+  // alone returned both sets mixed together, so asking "what did we delete?"
+  // was not answerable.
+  const [deleted, setDeleted] = useState<"off" | "with" | "only">("off");
   const [view, setView] = useState<"board" | "list">("board");
   const [openPerson, setOpenPerson] = useState<number | null>(null);
 
@@ -57,24 +69,43 @@ function TeamTasksInner() {
     router.replace(`/team-tasks?${next.toString()}`);
   };
 
+  /**
+   * Search text is held locally and committed to the URL on a pause.
+   */
+  const [queryDraft, setQueryDraft] = useState(filters.q);
+  const [syncedQuery, setSyncedQuery] = useState(filters.q);
+  if (filters.q !== syncedQuery) {
+    setSyncedQuery(filters.q);
+    setQueryDraft(filters.q);
+  }
+  useEffect(() => {
+    if (queryDraft === filters.q) return;
+    const timer = setTimeout(() => setFilter("q", queryDraft), 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queryDraft]);
+
   const tasks = useQuery({
-    queryKey: ["tasks", "team", page, filters, showDeleted],
+    queryKey: ["tasks", "team", page, filters, deleted],
     queryFn: () =>
       api<TaskList>(
-        `/tasks${qs({ ...filters, page, page_size: PAGE_SIZE, include_deleted: showDeleted })}`,
+        `/tasks${qs({
+          ...filters,
+          page,
+          page_size: PAGE_SIZE,
+          include_deleted: deleted === "with" ? true : undefined,
+          deleted_only: deleted === "only" ? true : undefined,
+        })}`,
       ),
     enabled: view === "list",
   });
 
   const board = useQuery({
-    queryKey: ["tasks", "board", filters.status, filters.q, filters.completed_from, filters.completed_to],
+    queryKey: ["tasks", "board", filters],
     queryFn: () =>
       api<TaskBoard>(
         `/tasks/board${qs({
-          status: filters.status,
-          q: filters.q,
-          completed_from: filters.completed_from,
-          completed_to: filters.completed_to,
+          ...filters,
           include_completed: filters.completed_from || filters.completed_to ? true : undefined,
         })}`,
       ),
@@ -98,8 +129,13 @@ function TeamTasksInner() {
   const invalidate = () => {
     void client.invalidateQueries({ queryKey: ["tasks"] });
   };
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayLocal();
   const total = tasks.data?.total ?? 0;
+
+  const people = board.data?.people ?? [];
+  const totalOpenBoard = people.reduce((acc, p) => acc + p.open_count, 0) + (board.data?.unassigned_count ?? 0);
+  const totalOverdueBoard = people.reduce((acc, p) => acc + p.overdue_count, 0);
+  const totalTrackedBoard = people.reduce((acc, p) => acc + p.tracked_seconds, 0);
 
   return (
     <>
@@ -111,78 +147,174 @@ function TeamTasksInner() {
             <Button variant="outline" onClick={() => setView(view === "board" ? "list" : "board")}>
               {view === "board" ? "Flat list" : "By person"}
             </Button>
-            <Button variant="outline" onClick={() => setShowDeleted((v) => !v)}>
-              {showDeleted ? "Hide deleted" : "Show deleted"}
+            <Button
+              variant="outline"
+              onClick={() => setDeleted(deleted === "off" ? "with" : deleted === "with" ? "only" : "off")}
+              aria-label={`Deleted tasks: ${deleted === "off" ? "hidden" : deleted === "with" ? "shown with live tasks" : "shown on their own"}`}
+            >
+              {deleted === "off" ? "Hide deleted" : deleted === "with" ? "Show deleted only" : "Show deleted too"}
             </Button>
             {capabilities.can_create_tasks ? (
               <Button onClick={() => setCreateOpen(true)}>
                 <Plus className="h-4 w-4" aria-hidden />
-                New task
+                New Task
               </Button>
             ) : null}
           </>
         }
       />
 
-      <div className="mb-4 flex flex-wrap gap-2">
-        <Input
-          className="h-9 max-w-xs"
-          placeholder="Search by title…"
-          value={filters.q}
-          onChange={(e) => setFilter("q", e.target.value)}
-        />
-        <Select className="h-9 w-auto" value={filters.status} onChange={(e) => setFilter("status", e.target.value)}>
-          <option value="">All statuses</option>
-          {Object.entries(STATUS_LABELS).map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
-            </option>
-          ))}
-        </Select>
-        <Select className="h-9 w-auto" value={filters.priority} onChange={(e) => setFilter("priority", e.target.value)}>
-          <option value="">All priorities</option>
-          {Object.entries(PRIORITY_LABELS).map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
-            </option>
-          ))}
-        </Select>
-        <Select
-          className="h-9 w-auto"
-          value={filters.assignee_id}
-          onChange={(e) => setFilter("assignee_id", e.target.value)}
-        >
-          <option value="">Everyone</option>
-          {(directory.data ?? []).map((entry) => (
-            <option key={entry.id} value={entry.id}>
-              {entry.full_name}
-            </option>
-          ))}
-        </Select>
-        <Select className="h-9 w-auto" value={filters.category} onChange={(e) => setFilter("category", e.target.value)}>
-          <option value="">All categories</option>
-          {Object.entries(CATEGORY_LABELS).map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
-            </option>
-          ))}
-        </Select>
-        <Button
-          variant={filters.overdue ? "default" : "outline"}
-          size="sm"
-          onClick={() => setFilter("overdue", filters.overdue ? "" : "true")}
-        >
-          Overdue only
-        </Button>
-        {filters.completed_from || filters.completed_to ? (
-          <Badge variant="outline">
-            Completed {filters.completed_from || "…"} → {filters.completed_to || "…"}
-          </Badge>
-        ) : null}
-        <Button variant="ghost" size="sm" onClick={() => router.replace("/team-tasks")}>
-          Clear
-        </Button>
+      {/* Team Summary Strip */}
+      <div className="mb-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="flex items-center justify-between rounded-2xl p-5 hero-green-card shadow-[0_8px_24px_rgba(20,83,56,0.18)]">
+          <div>
+            <p className="text-xs font-medium text-white/85">
+              {view === "board" ? "Open Team Tasks" : "Matching Tasks"}
+            </p>
+            <p className="mt-1 tabular text-3xl font-bold text-white">
+              {view === "board" ? totalOpenBoard : total}
+            </p>
+            <p className="mt-1 text-xs text-[#a9dfc2]">
+              {board.data?.unassigned_count
+                ? `${board.data.unassigned_count} unassigned`
+                : "Across active assignees"}
+            </p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-white/15 text-white">
+            <FolderKanban className="h-5 w-5" aria-hidden />
+          </span>
+        </div>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Active Assignees</p>
+            <p className="mt-1 tabular text-3xl font-bold text-foreground">{people.length}</p>
+            <p className="mt-1 text-xs text-[#1f7a52]">Carrying open tasks</p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <Users className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Overdue Tasks</p>
+            <p
+              className={`mt-1 tabular text-3xl font-bold ${
+                totalOverdueBoard > 0 ? "text-destructive" : "text-foreground"
+              }`}
+            >
+              {totalOverdueBoard}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">Needs attention</p>
+          </div>
+          <span
+            className={`flex h-10 w-10 items-center justify-center rounded-2xl ${
+              totalOverdueBoard > 0
+                ? "bg-[#fdecee] text-destructive"
+                : "bg-[#eaf4ef] text-[#145338]"
+            }`}
+          >
+            <AlertTriangle className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
+
+        <Card className="flex items-center justify-between p-5">
+          <div>
+            <p className="text-xs font-medium text-muted-foreground">Tracked on Open Work</p>
+            <p className="mt-1 tabular text-3xl font-bold text-foreground">
+              {formatHours(totalTrackedBoard)}
+            </p>
+            <p className="mt-1 text-xs text-[#1f7a52]">Logged across board</p>
+          </div>
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
+            <Clock className="h-5 w-5" aria-hidden />
+          </span>
+        </Card>
       </div>
+
+      {/* Filter Bar Card */}
+      <Card className="mb-5 p-3.5">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="relative min-w-[200px] flex-1 max-w-xs">
+            <Search
+              className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+              aria-hidden
+            />
+            <Input
+              className="h-9 rounded-full bg-[#f7f8f9] pl-9"
+              type="search"
+              placeholder="Search by title…"
+              aria-label="Search tasks by title"
+              value={queryDraft}
+              onChange={(e) => setQueryDraft(e.target.value)}
+            />
+          </div>
+          <Select
+            className="h-9 w-auto rounded-full px-4"
+            value={filters.status}
+            onChange={(e) => setFilter("status", e.target.value)}
+          >
+            <option value="">All statuses</option>
+            {Object.entries(STATUS_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </Select>
+          <Select
+            className="h-9 w-auto rounded-full px-4"
+            value={filters.priority}
+            onChange={(e) => setFilter("priority", e.target.value)}
+          >
+            <option value="">All priorities</option>
+            {Object.entries(PRIORITY_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </Select>
+          <Select
+            className="h-9 w-auto rounded-full px-4"
+            value={filters.assignee_id}
+            onChange={(e) => setFilter("assignee_id", e.target.value)}
+          >
+            <option value="">Everyone</option>
+            {(directory.data ?? []).map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.full_name}
+              </option>
+            ))}
+          </Select>
+          <Select
+            className="h-9 w-auto rounded-full px-4"
+            value={filters.category}
+            onChange={(e) => setFilter("category", e.target.value)}
+          >
+            <option value="">All categories</option>
+            {Object.entries(CATEGORY_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </Select>
+          <Button
+            variant={filters.overdue ? "default" : "outline"}
+            size="sm"
+            onClick={() => setFilter("overdue", filters.overdue ? "" : "true")}
+          >
+            Overdue only
+          </Button>
+          {filters.completed_from || filters.completed_to ? (
+            <Badge variant="outline">
+              Completed {filters.completed_from || "…"} → {filters.completed_to || "…"}
+            </Badge>
+          ) : null}
+          <Button variant="ghost" size="sm" onClick={() => router.replace("/team-tasks")}>
+            Clear
+          </Button>
+        </div>
+      </Card>
 
       {view === "board" ? (
         board.isLoading ? (
@@ -194,27 +326,27 @@ function TeamTasksInner() {
             }
             onRetry={() => void board.refetch()}
           />
-        ) : (board.data?.people.length ?? 0) === 0 && board.data?.unassigned_count === 0 ? (
+        ) : people.length === 0 && board.data?.unassigned_count === 0 ? (
           <EmptyState
             title="Nothing assigned right now"
             description="When work is assigned it appears here, grouped by person."
           />
         ) : (
-          <div className="space-y-2">
-            {(board.data?.people ?? []).map((person) => {
+          <div className="space-y-3">
+            {people.map((person) => {
               const expanded = openPerson === person.user.id;
               return (
-                <Card key={person.user.id}>
-                  <CardContent className="py-3">
+                <Card key={person.user.id} className="overflow-hidden transition-all hover:border-[#145338]/30">
+                  <CardContent className="p-0">
                     <button
                       type="button"
-                      className="flex w-full flex-wrap items-center gap-3 text-left"
+                      className="flex w-full flex-wrap items-center gap-3.5 px-5 py-4 text-left transition-colors hover:bg-muted/30"
                       onClick={() => setOpenPerson(expanded ? null : person.user.id)}
                       aria-expanded={expanded}
                     >
                       <Avatar person={person.user} size="md" />
                       <span className="flex min-w-0 flex-col">
-                        <span className="font-medium">{displayName(person.user)}</span>
+                        <span className="font-bold text-foreground">{displayName(person.user)}</span>
                         <span className="text-xs text-muted-foreground">
                           {roleLabel(person.user.role)}
                         </span>
@@ -224,26 +356,26 @@ function TeamTasksInner() {
                           <Badge variant="warning">{person.blocked_count} blocked</Badge>
                         ) : null}
                         {person.overdue_count > 0 ? (
-                          <Badge variant="warning">{person.overdue_count} overdue</Badge>
+                          <Badge variant="danger">{person.overdue_count} overdue</Badge>
                         ) : null}
-                        <Badge variant="outline">
-                          {person.open_count} open
-                        </Badge>
+                        <Badge variant="default">{person.open_count} open</Badge>
                         {person.tracked_seconds > 0 ? (
-                          <span className="tabular text-xs text-muted-foreground">
+                          <span className="tabular rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
                             {formatDuration(person.tracked_seconds)} tracked
                           </span>
                         ) : null}
-                        {expanded ? (
-                          <ChevronDown className="h-4 w-4" aria-hidden />
-                        ) : (
-                          <ChevronRight className="h-4 w-4" aria-hidden />
-                        )}
+                        <span className="ml-1 flex h-7 w-7 items-center justify-center rounded-full bg-muted/80 text-muted-foreground">
+                          {expanded ? (
+                            <ChevronDown className="h-4 w-4" aria-hidden />
+                          ) : (
+                            <ChevronRight className="h-4 w-4" aria-hidden />
+                          )}
+                        </span>
                       </span>
                     </button>
 
                     {expanded ? (
-                      <ul className="mt-3 border-l-2 border-border pl-3">
+                      <ul className="border-t border-border/70 bg-muted/15">
                         {person.tasks.map((task) => (
                           <TaskRow
                             key={task.id}
@@ -261,12 +393,14 @@ function TeamTasksInner() {
             })}
 
             {board.data && board.data.unassigned_count > 0 ? (
-              <Card className="border-dashed">
-                <CardContent className="py-3">
-                  <p className="text-sm font-medium">
-                    Unassigned · {board.data.unassigned_count}
-                  </p>
-                  <ul className="mt-2">
+              <Card className="overflow-hidden border-dashed">
+                <CardContent className="p-0">
+                  <div className="border-b border-border/60 bg-muted/30 px-5 py-3">
+                    <p className="text-sm font-bold">
+                      Unassigned · {board.data.unassigned_count}
+                    </p>
+                  </div>
+                  <ul>
                     {board.data.unassigned.map((task) => (
                       <TaskRow
                         key={task.id}
@@ -302,7 +436,7 @@ function TeamTasksInner() {
         />
       ) : (
         <>
-          <Card>
+          <Card className="overflow-hidden">
             <ul>
               {(tasks.data?.items ?? []).map((task) => (
                 <TaskRow

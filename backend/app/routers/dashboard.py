@@ -3,19 +3,21 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, case, func, literal_column, select
 from sqlalchemy.orm import Session
 
-from app import policy
+from app import aggregate, policy
 from app.config import settings
 from app.db import get_db
 from app.deps import CurrentUser, get_current_user
 from app.errors import forbidden
-from app.models import Task, TaskStatus, User, WorkSession, utcnow
-from app.serializers import local_today, running_session_for_user
+from app.models import EntryType, Task, TaskStatus, User, WorkSession, utcnow
+from app.serializers import elapsed, is_stale, local_today, running_session_for_user
 from app.timelog import to_utc
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+_now_jd = literal_column("julianday('now')")
 
 OPEN_STATUSES = (
     TaskStatus.todo.value,
@@ -35,12 +37,16 @@ def _range(days: int) -> tuple[datetime, datetime]:
     return start_local.astimezone(tz).replace(tzinfo=None), end_local.astimezone(tz).replace(tzinfo=None)
 
 
-def _period(period: str) -> tuple[datetime, datetime]:
-    """A named window: today, week, month, or the trailing N days.
+def _window(period: str, days: int | None) -> tuple[datetime, datetime]:
+    """A named window: today, week, month, quarter, or an explicit day count.
 
     `today` is what people reach for first — "what happened today" is a
-    different question from "what happened in the last seven days".
+    different question from "what happened in the last seven days". An explicit
+    `days` wins over `period`; before this, `?days=30` was validated and then
+    thrown away.
     """
+    if days is not None:
+        return _range(days)
     if period == "today":
         today = local_today()
         tz = settings.tz
@@ -92,17 +98,19 @@ def _status_counts(db: Session, stmt: Select) -> dict[str, int]:
 
 
 def _tracked(db: Session, task_stmt: Select, start: datetime, end: datetime) -> int:
+    """Seconds tracked in the window, counting what is accruing right now.
+
+    Filtering out open entries -- which every roll-up used to do -- reported a
+    person with six hours on the clock as having zero.
+    """
     sub = _alias(task_stmt)
-    total = db.scalar(
-        select(func.coalesce(func.sum(WorkSession.duration_seconds), 0)).where(
-            WorkSession.task_id.in_(select(sub.c.id)),
-            WorkSession.deleted_at.is_(None),
-            WorkSession.ended_at.is_not(None),
-            WorkSession.started_at >= start,
-            WorkSession.started_at <= end,
-        )
+    return aggregate.tracked_seconds_in_range(
+        db, start, end, task_ids=select(sub.c.id)
     )
-    return int(total or 0)
+
+
+def _tracked_by_assignee(db: Session, start: datetime, end: datetime) -> dict[int, int]:
+    return aggregate.tracked_seconds_by_assignee(db, start, end)
 
 
 def _working_now(db: Session, current: CurrentUser) -> list[dict]:
@@ -141,22 +149,16 @@ def _member_load(db: Session, task_stmt: Select, start: datetime, end: datetime)
         .group_by(User.id, User.full_name, User.role)
         .order_by(User.full_name)
     ).all()
-    out = []
-    for uid, full_name, role, open_count in rows:
-        seconds = _tracked(
-            db,
-            select(Task.id).where(Task.assignee_id == uid, Task.deleted_at.is_(None)),
-            start,
-            end,
-        )
-        out.append(
-            {
-                "user": {"id": uid, "full_name": full_name, "role": role},
-                "open_tasks": int(open_count),
-                "tracked_seconds": seconds,
-            }
-        )
-    return out
+    # One roll-up for the whole team instead of one per person.
+    seconds_by_user = _tracked_by_assignee(db, start, end)
+    return [
+        {
+            "user": {"id": uid, "full_name": full_name, "role": role},
+            "open_tasks": int(open_count),
+            "tracked_seconds": seconds_by_user.get(uid, 0),
+        }
+        for uid, full_name, role, open_count in rows
+    ]
 
 
 def _base_payload(db: Session, current: CurrentUser, stmt: Select, start: datetime, end: datetime) -> dict:
@@ -215,16 +217,16 @@ def _base_payload(db: Session, current: CurrentUser, stmt: Select, start: dateti
 def executive(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-    days: int = Query(default=7, ge=1, le=90),
+    days: int | None = Query(default=None, ge=1, le=90),
     period: str = Query(default="week"),
 ):
     if not policy.capabilities(current.user)["can_view_executive_dashboard"]:
         raise forbidden("FORBIDDEN", "The executive dashboard is for the CEO and team lead")
-    start, end = _period(period)
+    start, end = _window(period, days)
     stmt = _visible_tasks(current)
     payload = _base_payload(db, current, stmt, start, end)
     payload["period"] = period
-    payload["period_label"] = _period_label(period, days)
+    payload["period_label"] = _period_label(period, days or 7)
     payload["members"] = _member_load(db, stmt, start, end)
     return payload
 
@@ -233,14 +235,14 @@ def executive(
 def lead(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-    days: int = Query(default=7, ge=1, le=90),
+    days: int | None = Query(default=None, ge=1, le=90),
     period: str = Query(default="week"),
     assignee_id: int | None = Query(default=None),
     category: str | None = Query(default=None),
 ):
     if not policy.capabilities(current.user)["can_view_lead_dashboard"]:
         raise forbidden("FORBIDDEN", "The team lead dashboard is for the CEO and team lead")
-    start, end = _period(period)
+    start, end = _window(period, days)
     stmt = _visible_tasks(current)
     if assignee_id is not None:
         stmt = stmt.where(Task.assignee_id == assignee_id)
@@ -248,7 +250,7 @@ def lead(
         stmt = stmt.where(Task.category == category)
     payload = _base_payload(db, current, stmt, start, end)
     payload["period"] = period
-    payload["period_label"] = _period_label(period, days)
+    payload["period_label"] = _period_label(period, days or 7)
     payload["members"] = _member_load(db, stmt, start, end)
 
     sub = _alias(stmt)
@@ -281,22 +283,22 @@ def lead(
 def personal(
     current: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
-    days: int = Query(default=7, ge=1, le=90),
+    days: int | None = Query(default=None, ge=1, le=90),
     period: str = Query(default="week"),
 ):
-    start, end = _period(period)
+    start, end = _window(period, days)
     stmt = select(Task).where(Task.deleted_at.is_(None), Task.assignee_id == current.user.id)
     payload = _base_payload(db, current, stmt, start, end)
 
     daily = db.execute(
         select(
             func.date(WorkSession.started_at).label("day"),
-            func.coalesce(func.sum(WorkSession.duration_seconds), 0),
+            func.coalesce(aggregate.live_seconds_expr(), 0),
         )
         .where(
             WorkSession.user_id == current.user.id,
             WorkSession.deleted_at.is_(None),
-            WorkSession.ended_at.is_not(None),
+            WorkSession.entry_type == EntryType.work_session.value,
             WorkSession.started_at >= start,
             WorkSession.started_at <= end,
         )
@@ -352,15 +354,19 @@ def personal(
     running = running_session_for_user(db, current.user.id)
     payload["worklists"] = _worklists(db, stmt, today)
     payload["period"] = period
-    payload["period_label"] = _period_label(period, days)
+    payload["period_label"] = _period_label(period, days or 7)
     if running is not None:
+        task = db.get(Task, running.task_id)
+        # `elapsed_seconds` and `is_stale` were hardcoded to 0 and False here,
+        # so the personal dashboard reported a running timer as brand new. The
+        # real values live in `_worklists` below, unreachable after a `return`.
         payload["running"] = {
             "log_id": running.id,
             "task_id": running.task_id,
-            "task_title": (db.get(Task, running.task_id).title if db.get(Task, running.task_id) else "Task"),
+            "task_title": task.title if task else "Task",
             "started_at": running.started_at,
-            "elapsed_seconds": 0,
-            "is_stale": False,
+            "elapsed_seconds": elapsed(running),
+            "is_stale": is_stale(running),
         }
     return payload
 
@@ -429,20 +435,6 @@ def _worklists(db: Session, stmt: Select, today) -> dict:
             sub.c.blocked_reason.is_not(None),
         ),
     }
-    payload["running"] = None
-    if running is not None:
-        task = db.get(Task, running.task_id)
-        from app.serializers import elapsed, is_stale
-
-        payload["running"] = {
-            "log_id": running.id,
-            "task_id": running.task_id,
-            "task_title": task.title if task else "Task",
-            "started_at": running.started_at,
-            "elapsed_seconds": elapsed(running),
-            "is_stale": is_stale(running),
-        }
-    return payload
 
 
 @router.get("/time-summary")
@@ -459,17 +451,19 @@ def time_summary(
     stmt = select(WorkSession).where(
         WorkSession.user_id == target,
         WorkSession.deleted_at.is_(None),
-        WorkSession.ended_at.is_not(None),
+        WorkSession.entry_type == EntryType.work_session.value,
         WorkSession.started_at >= start,
         WorkSession.started_at <= end,
     )
     sub = stmt.subquery().alias("s")
+    # Counted per task rather than per row: a running session contributes to
+    # exactly one task, so summing the live expression is still correct here.
     rows = db.execute(
-        select(sub.c.task_id, Task.title, func.coalesce(func.sum(sub.c.duration_seconds), 0))
+        select(sub.c.task_id, Task.title, func.coalesce(func.sum(_live_seconds(sub.c)), 0))
         .select_from(sub.join(Task, Task.id == sub.c.task_id))
         .where(Task.deleted_at.is_(None))
         .group_by(sub.c.task_id, Task.title)
-        .order_by(func.sum(sub.c.duration_seconds).desc())
+        .order_by(func.sum(_live_seconds(sub.c)).desc())
     ).all()
     total = sum(int(r[2]) for r in rows)
     return {
@@ -480,3 +474,12 @@ def time_summary(
             {"task_id": r[0], "title": r[1], "seconds": int(r[2])} for r in rows
         ],
     }
+
+
+def _live_seconds(col):
+    """Live seconds for an aliased `task_logs` subquery column."""
+    return case(
+        (col.ended_at.is_(None),
+         func.max(0, (_now_jd - func.julianday(col.started_at)) * 86400)),
+        else_=0,
+    )

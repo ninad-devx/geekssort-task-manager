@@ -61,8 +61,48 @@ def init_db() -> None:
     conn = engine.raw_connection()
     try:
         install_audit_triggers(conn)
+        apply_schema_repairs(conn)
     finally:
         conn.close()
+
+
+def apply_schema_repairs(db_conn) -> None:
+    """Bring an existing database in line with the current models.
+
+    `create_all` only ever adds whole missing tables; it never alters one. Two
+    corrections have to be applied by hand to a database created before them,
+    and both are idempotent so this is safe to run on every boot.
+    """
+    from app.models import utcnow
+
+    cur = db_conn.cursor()
+    try:
+        # A soft-deleted row with `ended_at IS NULL` used to occupy the running
+        # timer slot forever. Close them so the corrected index can be built.
+        cur.execute(
+            "UPDATE task_logs SET ended_at = ?, duration_seconds = COALESCE(duration_seconds, 0) "
+            "WHERE ended_at IS NULL AND deleted_at IS NOT NULL",
+            # Passed as text: the default datetime adapter is deprecated, and
+            # SQLite has no native datetime type anyway.
+            (utcnow().isoformat(sep=" "),),
+        )
+        cur.execute("DROP INDEX IF EXISTS uq_running_session_per_user_task")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_running_session_per_user_task "
+            "ON task_logs (user_id, task_id) "
+            "WHERE ended_at IS NULL AND deleted_at IS NULL"
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_folder_sibling_name "
+            "ON workspace_folders (parent_id, name) WHERE deleted_at IS NULL"
+        )
+    except Exception:
+        # A database that predates these tables cannot be repaired here, and a
+        # failed repair must not stop the app from starting.
+        db_conn.rollback()
+    finally:
+        cur.close()
+    db_conn.commit()
 
 
 def install_audit_triggers(db_conn) -> None:
