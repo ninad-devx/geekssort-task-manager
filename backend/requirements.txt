@@ -1,6 +1,11 @@
 fastapi>=0.115
 uvicorn[standard]>=0.32
 sqlalchemy>=2.0.36
+# PostgreSQL driver (psycopg 3). Unused when DATABASE_URL is a sqlite:/// URL,
+# so local SQLite development needs nothing extra -- but it must be installed in
+# any image that might be pointed at PostgreSQL, and requirements.txt is a single
+# file shared by both, so it is unconditional.
+psycopg[binary]>=3.2
 pydantic>=2.9
 pydantic-settings>=2.6
 argon2-cffi>=23.1

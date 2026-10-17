@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, case, func, literal_column, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app import aggregate, policy
@@ -16,8 +16,6 @@ from app.serializers import elapsed, is_stale, local_today, running_session_for_
 from app.timelog import to_utc
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
-
-_now_jd = literal_column("julianday('now')")
 
 OPEN_STATUSES = (
     TaskStatus.todo.value,
@@ -477,9 +475,9 @@ def time_summary(
 
 
 def _live_seconds(col):
-    """Live seconds for an aliased `task_logs` subquery column."""
-    return case(
-        (col.ended_at.is_(None),
-         func.max(0, (_now_jd - func.julianday(col.started_at)) * 86400)),
-        else_=0,
-    )
+    """Live seconds for an aliased `task_logs` subquery column.
+
+    Delegates to the shared, dialect-aware expression so this subquery cannot
+    drift from `aggregate.live_seconds_expr()`.
+    """
+    return aggregate.live_seconds(col.ended_at, col.started_at)

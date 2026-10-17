@@ -5,6 +5,9 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+
 from app.db import SessionLocal
 from app.models import WorkSession
 from tests.conftest import CSRF, login
@@ -457,19 +460,21 @@ def test_audit_events_cannot_be_updated_or_deleted(client, users):
     login(client, "m1@x.com")
     t = task_for(client)
     add_manual(client, t["id"], started_at=utc(hours=-4), ended_at=utc(hours=-2))
-    from app.config import settings
 
-    raw = sqlite3.connect(settings.DATABASE_URL.replace("sqlite:///", ""))
+    # Driven through the app's own engine rather than a raw sqlite3 handle so the
+    # same assertions cover the PostgreSQL triggers as well.
+    db = SessionLocal()
     try:
-        assert raw.execute("SELECT count(*) FROM audit_events").fetchone()[0] > 0
+        assert db.execute(text("SELECT count(*) FROM audit_events")).scalar() > 0
         for sql in ("UPDATE audit_events SET summary='x'", "DELETE FROM audit_events"):
             try:
-                raw.execute(sql)
+                db.execute(text(sql))
+                db.commit()
                 raise AssertionError(f"audit_events was mutable: {sql}")
-            except sqlite3.IntegrityError:
-                pass
+            except (sqlite3.IntegrityError, DBAPIError):
+                db.rollback()
     finally:
-        raw.close()
+        db.close()
 
 
 def test_no_endpoint_exposes_audit_mutation(client, users):

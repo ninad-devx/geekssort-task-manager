@@ -146,21 +146,31 @@ def test_a_stray_non_integer_audit_row_cannot_blank_the_feed(client, users):
     client.post("/api/tasks", headers=CSRF, json={"title": "T"})
 
     # write straight past the ORM, the way the original bug did
+    import pytest
     from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
 
-    from app.db import SessionLocal
+    from app.db import IS_POSTGRES, SessionLocal
 
+    bad_insert = text(
+        "INSERT INTO audit_events (event_type, request_id, actor_name, entity_type, "
+        "entity_id, summary, created_at) VALUES ('task.created', 'x', 'system', "
+        "'category', 'a_slug_not_a_number', 'bad row', '2026-01-01 00:00:00')"
+    )
     db = SessionLocal()
     try:
-        db.execute(text("DROP TRIGGER IF EXISTS audit_events_no_update"))
-        db.execute(
-            text(
-                "INSERT INTO audit_events (event_type, request_id, actor_name, entity_type, "
-                "entity_id, summary, created_at) VALUES ('task.created', 'x', 'system', "
-                "'category', 'a_slug_not_a_number', 'bad row', '2026-01-01 00:00:00')"
-            )
-        )
-        db.commit()
+        if IS_POSTGRES:
+            # Postgres refuses the row outright: entity_id is INTEGER and the
+            # text will not cast. That is the stronger of the two outcomes --
+            # the corrupt row cannot exist at all -- so assert the refusal and
+            # then that the feed is unharmed.
+            with pytest.raises(DBAPIError):
+                db.execute(bad_insert)
+            db.rollback()
+        else:
+            db.execute(text("DROP TRIGGER IF EXISTS audit_events_no_update"))
+            db.execute(bad_insert)
+            db.commit()
     finally:
         db.close()
 

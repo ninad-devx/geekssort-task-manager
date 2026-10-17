@@ -1,0 +1,161 @@
+# Production topology for a single VPS.
+#
+#   host nginx :443  --loopback-->  frontend:3000  --network-->  backend:8000
+#   TLS terminates on the host; both containers stay off the public internet.
+#
+#   backend:8000  --network-->  db:5432   (only with the -db override below)
+#
+# Nothing here is published except one loopback port. The backend is deliberately
+# unreachable from outside the compose network -- it is an internal API that the
+# browser has no reason to talk to directly, and exposing it would put a second
+# origin in front of the Origin check in app/deps.py.
+#
+# PostgreSQL, two ways -- pick one:
+#
+#   * Database elsewhere (Contabo's bundled PostgreSQL, a managed provider, or
+#     PostgreSQL installed on the VPS host). This is the default and the only
+#     file you need:
+#         docker compose up -d --build
+#     Set DATABASE_URL in .env to that host.
+#
+#   * Database bundled here as a container. Add the override file:
+#         docker compose -f docker-compose.yml -f docker-compose.db.yml up -d --build
+#     It adds a private Postgres on the internal network with a named volume,
+#     gates the backend on its health check, and expects
+#     DATABASE_URL=postgresql+psycopg://...@db:5432/taskssort.
+#     A separate file rather than a `profiles:` entry because Compose
+#     interpolates ${VAR:?...} across the whole file before it looks at
+#     profiles, so a profile-gated service would still make this file refuse to
+#     start for anyone not using a bundled database.
+#
+# From inside the backend container, `localhost` is the backend container. That
+# is why the bundled database's host name is `db` and not `localhost`.
+#
+# Both containers: run from the repository root.
+
+name: taskssort
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: taskssort-backend
+    restart: unless-stopped
+    # Deliberately no `ports:`. Reachable only as http://backend:8000 from the
+    # frontend container. If you need to reach it from the host, bind it to
+    # loopback explicitly instead of exposing it.
+    expose:
+      - "8000"
+    environment:
+      # THE database selection. See backend/.env.example for the full syntax.
+      # Do NOT hardcode a host here: the right value differs depending on whether
+      # PostgreSQL is the bundled `db` service or something outside Compose.
+      # It comes from the VPS .env file, which is the single source of truth.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required - copy .env.example to .env and set it}
+      # PostgreSQL pool. Harmless when DATABASE_URL is a sqlite:/// URL, since
+      # app/config.py scopes every one of these to the PostgreSQL branch.
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-30}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
+      # Match your team's actual zone; "Today", due dates and daily totals use it.
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Kolkata}
+      # REQUIRED behind TLS. Leaving this false ships the session cookie without
+      # the Secure flag, so any accidental plain-HTTP request leaks it.
+      COOKIE_SECURE: "true"
+      # REQUIRED. Without it every request appears to come from the frontend
+      # container, and the login rate limit becomes a single global bucket that
+      # one attacker can trip to lock out the whole team.
+      # This works only because nginx sets X-Forwarded-For and the Next.js
+      # rewrite forwards the header through untouched -- see the nginx note in
+      # the run instructions.
+      TRUST_PROXY_HEADERS: "true"
+      # Do not set this to your public domain. Requests arrive via the rewrite,
+      # so the origin is matched against the request's own forwarded host and no
+      # allowlist entry is needed. Adding one here would also make this service
+      # answer CORS preflights for that domain.
+      DEV_ORIGINS: ${DEV_ORIGINS:-}
+    volumes:
+      # Only meaningful for SQLite. With PostgreSQL this directory holds nothing
+      # the app needs and the bind mount is harmless. Keep it so switching
+      # DATABASE_URL back to a sqlite:/// URL needs no other change -- and see
+      # the chown note in the run instructions: the image runs as uid 10001.
+      - ./backend/data:/app/data
+    networks:
+      - taskssort
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/api/health', timeout=2).status == 200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    # Give SQLite time to flush the WAL before SIGKILL. With PostgreSQL there is
+    # nothing to flush -- open transactions are rolled back server-side -- so
+    # this is only about not killing in-flight requests mid-response.
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # MUST stay in step with the backend service name. This is a build arg,
+        # not just an environment variable: next build freezes the /api/:path*
+        # rewrite destination into .next/routes-manifest.json. Setting it only
+        # at run time would leave the rewrite aimed at the address the image was
+        # built with -- 127.0.0.1:8000 inside this container, where nothing
+        # listens -- while the server-side session check in src/lib/dal.ts
+        # picked up the new value. The result is pages that render but whose
+        # every API call fails.
+        API_ORIGIN: ${API_ORIGIN:-http://backend:8000}
+    image: taskssort-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        # Wait for the API to be genuinely serving, not merely started. Without
+        # this the first request after a cold boot hits a dead backend and
+        # dal.ts raises ApiUnavailableError, which renders as a 500 rather than
+        # a "please try again".
+        condition: service_healthy
+    ports:
+      # Loopback only. Host nginx terminates TLS and proxies here. Do not change
+      # this to a bare "3000:3000" -- that publishes the app to the internet and
+      # drops you back into CORS and cookie-security problems.
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Read at runtime by src/lib/dal.ts. Keep identical to the build arg above.
+      API_ORIGIN: ${API_ORIGIN:-http://backend:8000}
+      # Must match the backend's COOKIE_NAME, or dal.ts looks for a cookie the
+      # API never sets and every protected page redirects to /login.
+      SESSION_COOKIE: ${SESSION_COOKIE:-mos_session}
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    networks:
+      - taskssort
+    # /icon.png is prerendered and never touches the backend, so a backend
+    # outage cannot mark this container unhealthy and get it restarted.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/icon.png').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # Named rather than default so it is obvious what the two containers share,
+  # and so unrelated compose projects do not end up on the same network.
+  # Without an explicit `name` compose derives "taskssort_taskssort".
+  taskssort:
+    name: taskssort-net
+    driver: bridge

@@ -1,6 +1,6 @@
 "use client";
 
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useEffect, useMemo, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -40,10 +40,18 @@ const SESSION_KEY = ["session"];
 export function AuthProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const router = useRouter();
+  const pathname = usePathname();
 
   const { data: session } = useQuery({
     queryKey: SESSION_KEY,
-    queryFn: () => api<SessionInfo>("/auth/me"),
+    // `silent401`: this probe is the one request whose 401 is a legitimate
+    // answer rather than a lost session, because it also runs on public pages
+    // where nobody is signed in. Without the opt-out it announced its own 401,
+    // the handler below cleared the cache and refreshed the router, the refetch
+    // 401'd again, and /login sat in a permanent request loop that kept the
+    // main thread busy enough to make the caret flicker and the input feel
+    // unusable. A real expiry still surfaces: every other query 401s too.
+    queryFn: () => api<SessionInfo>("/auth/me", { silent401: true }),
     retry: false,
     staleTime: 60_000,
     refetchOnWindowFocus: true,
@@ -54,13 +62,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // is rendered on the way out, then send them to sign in again.
   useEffect(() => {
     const onExpired = () => {
+      // Already on the login page: there is nowhere to send them, and the
+      // replace + refresh pair costs a full server-component round trip that
+      // would re-mount this provider and start the query again. Bail out.
+      if (pathname === "/login") {
+        queryClient.clear();
+        return;
+      }
       queryClient.clear();
       router.replace("/login");
       router.refresh();
     };
     window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
-  }, [queryClient, router]);
+  }, [queryClient, router, pathname]);
 
   const loginMutation = useMutation({
     mutationFn: (input: { email: string; password: string }) =>
@@ -102,28 +117,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     onSuccess: refreshSession,
   });
 
+  // `useMutation` hands back a fresh result object on every render, so depending
+  // on the mutation objects made the memo below a no-op: the context value got a
+  // new identity each render and every useAuth() consumer re-rendered with it,
+  // turning any single re-render into a cascade. The mutateAsync functions are
+  // the stable part of that result. If they ever turn out not to be, this simply
+  // degrades to the old behaviour rather than breaking anything.
+  const { mutateAsync: runLogin } = loginMutation;
+  const { mutateAsync: runLogout } = logoutMutation;
+  const { mutateAsync: runChangePassword } = changePasswordMutation;
+  const { mutateAsync: runUpdateProfile } = updateProfileMutation;
+
   const value = useMemo<AuthValue>(
     () => ({
       user: session?.user ?? null,
       capabilities: session?.capabilities ?? null,
       appTimezone: session?.app_timezone ?? "UTC",
       login: async (email, password) => {
-        await loginMutation.mutateAsync({ email, password });
+        await runLogin({ email, password });
       },
       logout: async () => {
-        await logoutMutation.mutateAsync();
+        await runLogout();
       },
       changePassword: async (currentPassword, newPassword) => {
-        await changePasswordMutation.mutateAsync({
+        await runChangePassword({
           current_password: currentPassword,
           new_password: newPassword,
         });
       },
       updateProfile: async (input) => {
-        await updateProfileMutation.mutateAsync(input);
+        await runUpdateProfile(input);
       },
     }),
-    [session, loginMutation, logoutMutation, changePasswordMutation, updateProfileMutation],
+    [session, runLogin, runLogout, runChangePassword, runUpdateProfile],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

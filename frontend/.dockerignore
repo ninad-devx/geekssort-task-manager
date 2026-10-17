@@ -1,0 +1,43 @@
+# Build context is frontend/. See backend/.dockerignore for the sibling notes.
+
+# node_modules MUST be excluded. sharp resolves a *different* native binary per
+# platform at install time (@img/sharp-linux-x64 vs sharp-win32-x64), and
+# npm_modules built on a Windows dev machine would be copied straight through to
+# a Linux image, where next would fail to load sharp on first use. The Dockerfile
+# runs `npm ci` inside the image precisely so this directory is never the source.
+node_modules/
+
+# .next MUST be excluded. Anything built on the host traces that host's platform
+# binaries and embeds build-time config (notably the frozen /api rewrite
+# destination in routes-manifest.json). The Dockerfile builds inside the image.
+.next/
+out/
+.turbo/
+
+# Stray build and type-check artefacts.
+tsconfig.tsbuildinfo
+next-env.d.ts
+*.tsbuildinfo
+.eslintcache
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+
+# VCS and editor noise.
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# Docs and agent instruction files -- not needed to serve the app.
+README.md
+AGENTS.md
+
+# The Dockerfile itself and container/orchestration descriptors.
+Dockerfile
+.dockerignore
+docker-compose*.yml
+compose*.yml

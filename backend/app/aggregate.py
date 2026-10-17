@@ -19,19 +19,49 @@ from __future__ import annotations
 from sqlalchemy import case, func, literal_column, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import Task, WorkSession, utcnow
 
-# `julianday` is SQLite's date function and the app is SQLite-only (WAL,
-# foreign_keys pragma, partial indexes written as sqlite_where). Timestamps are
-# stored as naive UTC, which is what SQLite reads them as.
-_now_jd = literal_column("julianday('now')")
-
-# Seconds accrued by an entry that has not been paused yet, floored at zero.
-LIVE_SECONDS = case(
-    (WorkSession.ended_at.is_(None),
-     func.max(0, (_now_jd - func.julianday(WorkSession.started_at)) * 86400)),
-    else_=0,
+# "Seconds since the epoch, right now", in each dialect's own spelling.
+#
+# Neither engine agrees on one, and neither does SQLAlchemy: SQLite's answer is
+# a Julian day (a REAL of days since 4713 BCE), while Postgres has no numeric
+# cast for `now()` at all -- `now()` is timestamptz and the stored columns are
+# naive `timestamp`, so subtracting them directly is a type error. The columns
+# hold naive UTC, which is what `now() AT TIME ZONE 'UTC'` produces, so the
+# difference is the elapsed interval either way and `EXTRACT(EPOCH ...)` reads
+# it back out in seconds.
+#
+# Read from `app.config`, not from `app.db`, so this module stays free of any
+# dependency on the engine having been built.
+_NOW = (
+    literal_column("julianday('now')")
+    if settings.is_sqlite
+    else literal_column("(now() AT TIME ZONE 'UTC')")
 )
+
+
+def live_seconds(ended_at_col, started_at_col) -> case:
+    """Seconds accrued by an entry that has not been paused yet, floored at zero.
+
+    The floor is a `CASE`, not `max(a, b)`. SQLite has a two-argument scalar
+    `max()`, PostgreSQL's `max()` is an aggregate that takes exactly one
+    argument, so `max(0, x)` is a syntax error there -- and `greatest()` is not
+    available in older SQLite either. A nested `CASE` is valid on both and
+    matches the old `max(0, x)` semantics exactly, NULL included: a NULL
+    comparison is not true, so a NULL elapsed value falls through to `else_`.
+    """
+    if settings.is_sqlite:
+        elapsed = (_NOW - func.julianday(started_at_col)) * 86400
+    else:
+        elapsed = func.extract("epoch", _NOW - started_at_col)
+    return case(
+        (ended_at_col.is_(None), case((elapsed < 0, 0), else_=elapsed)),
+        else_=0,
+    )
+
+
+LIVE_SECONDS = live_seconds(WorkSession.ended_at, WorkSession.started_at)
 
 
 def _not_deleted():

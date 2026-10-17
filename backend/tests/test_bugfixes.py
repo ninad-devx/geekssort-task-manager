@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import select, text
 
 from app.aggregate import tracked_seconds
-from app.db import SessionLocal, engine
+from app.db import IS_POSTGRES, SessionLocal, engine
 from app.models import LoginAttempt, Role, Task, WorkSession, utcnow
 from app.serializers import TaskContext
 from tests.conftest import CSRF, login, make_user
@@ -144,19 +144,37 @@ def test_the_audited_summary_says_nobody_for_an_unassigned_task(client, users):
 
 def test_the_declared_indexes_actually_exist(client, users):
     """`uq_folder_sibling_name` was declared as a module-level Index built from
-    strings, so it had no owning Table and `create_all` never emitted it."""
+    strings, so it had no owning Table and `create_all` never emitted it.
+
+    Both partial indexes must exist *and* must still be partial. A partial index
+    whose predicate was only declared for the other dialect silently degrades
+    into a full unique index, which does not fail loudly -- it just forbids
+    legitimate rows, e.g. a user having two closed sessions on one task.
+    """
     db = SessionLocal()
     try:
-        names = {
-            r[0]
-            for r in db.execute(
-                text("select name from sqlite_master where type='index'")
+        if IS_POSTGRES:
+            rows = db.execute(
+                text(
+                    "select indexname, indexdef from pg_indexes "
+                    "where schemaname = current_schema() and indexname in "
+                    "('uq_folder_sibling_name', 'uq_running_session_per_user_task')"
+                )
             ).all()
-        }
+        else:
+            rows = db.execute(
+                text("select name, sql from sqlite_master where type='index'")
+            ).all()
     finally:
         db.close()
-    assert "uq_folder_sibling_name" in names
-    assert "uq_running_session_per_user_task" in names
+    defs = {r[0]: (r[1] or "") for r in rows}
+    assert "uq_folder_sibling_name" in defs, defs
+    assert "uq_running_session_per_user_task" in defs, defs
+    # The predicate must be present, or the index is over the whole table.
+    assert "WHERE" in defs["uq_folder_sibling_name"].upper(), defs["uq_folder_sibling_name"]
+    assert "WHERE" in defs["uq_running_session_per_user_task"].upper(), defs[
+        "uq_running_session_per_user_task"
+    ]
 
 
 # --- ownership of a running timer -------------------------------------------

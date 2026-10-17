@@ -36,9 +36,24 @@ export class NetworkError extends Error {
 /** Raised when the session is no longer valid. AuthProvider listens for it. */
 export const SESSION_EXPIRED_EVENT = "mos:session-expired";
 
-type Options = Omit<RequestInit, "body"> & { body?: unknown; json?: unknown };
+type Options = Omit<RequestInit, "body"> & {
+  body?: unknown;
+  json?: unknown;
+  /**
+   * Suppresses the session-expired announcement for this request.
+   *
+   * Only the /auth/me probe needs it. On a public page that probe answering 401
+   * is the correct, expected state -- "nobody is signed in here" -- not a lost
+   * session. Treating it as an expiry made the session probe dispatch the event
+   * that clears the cache and refreshes the router, which sent the query to
+   * 401 again, which dispatched the event again: a self-sustaining request loop
+   * on /login. A genuine expiry still reaches the app through every other query.
+   */
+  silent401?: boolean;
+};
 
 export async function api<T>(path: string, options: Options = {}): Promise<T> {
+  const { silent401 = false, ...fetchOptions } = options;
   const method = (options.method ?? "GET").toUpperCase();
   const isWrite = !["GET", "HEAD", "OPTIONS"].includes(method);
 
@@ -57,7 +72,7 @@ export async function api<T>(path: string, options: Options = {}): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path.startsWith("/api") ? path : `/api${path}`, {
-      ...options,
+      ...fetchOptions,
       method,
       headers,
       body,
@@ -75,8 +90,8 @@ export async function api<T>(path: string, options: Options = {}): Promise<T> {
     const detail = parseErrorDetail(text, response.statusText);
     // A 401 anywhere means the cookie is gone or expired. Announce it once so
     // the app can send the person back to the login page instead of stranding
-    // them on an error screen.
-    if (response.status === 401 && typeof window !== "undefined") {
+    // them on an error screen. `silent401` opts out -- see the option's docstring.
+    if (response.status === 401 && !silent401 && typeof window !== "undefined") {
       window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT));
     }
     throw new ApiError(response.status, detail);

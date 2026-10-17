@@ -283,6 +283,7 @@ class WorkSession(Base):
             "task_id",
             unique=True,
             sqlite_where=text("ended_at IS NULL AND deleted_at IS NULL"),
+            postgresql_where=text("ended_at IS NULL AND deleted_at IS NULL"),
         ),
     )
 
@@ -343,6 +344,7 @@ class Folder(Base):
             "name",
             unique=True,
             sqlite_where=text("deleted_at IS NULL"),
+            postgresql_where=text("deleted_at IS NULL"),
         ),
     )
 

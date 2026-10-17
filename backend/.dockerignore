@@ -1,0 +1,51 @@
+# Build context is backend/. Everything here is either rebuilt by the image,
+# must never be baked in, or would bloat the context without being used.
+
+# Virtualenvs and caches -- orders of magnitude larger than the actual source.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# The development SQLite database. backend/data/marketingos.db is force-tracked
+# in git (.gitignore has an explicit `!` for it), so it WILL be in the build
+# context unless excluded here. Baking it in ships demo rows and logins to
+# production; at run time /app/data is a volume and overrides anything in the
+# image anyway.
+data/
+
+# Tests are not shipped. Note that requirements.txt is a single file that still
+# lists pytest/httpx, so those install into the image as well -- harmless, but
+# that is the cost of not splitting the requirements file.
+tests/
+
+# Local configuration and secrets. app/config.py reads BACKEND_DIR/.env, so a
+# copied .env would be baked into an image layer and stay in the image history.
+# Inject configuration through `docker run -e` or an orchestrator instead.
+.env
+.env.*
+!.env.example
+
+# Stray database sidecars and operator backups.
+*.db
+*.db-*
+*.db-journal
+*.sqlite
+*.sqlite3
+*.bak-*
+
+# VCS and editor noise.
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# The Dockerfile itself and container/orchestration descriptors.
+Dockerfile
+.dockerignore
+docker-compose*.yml
+compose*.yml

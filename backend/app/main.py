@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from app import audit
 from app.config import settings
-from app.db import init_db
+from app.db import engine, init_db, wait_for_database
 from app.deps import enforce_csrf, set_request_context
 from app.errors import AppError
 from app.routers import audit as audit_router
@@ -18,8 +18,20 @@ from app.routers import auth, categories, dashboard, logs, notifications, permis
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Prove the database answers before the first request is served. With
+    # DB_CONNECT_WAIT_SECONDS=0 (the default, and what Compose should use) this
+    # is a single ping, so a wrong host or password aborts the boot with the
+    # driver's own error instead of surfacing as a 500 later -- and it never
+    # falls back to SQLite.
+    wait_for_database()
     init_db()
-    yield
+    try:
+        yield
+    finally:
+        # Release every pooled connection on shutdown rather than waiting for
+        # the process to be killed. `restart: unless-stopped` sends SIGTERM,
+        # so this is the code path that actually runs on every deploy.
+        engine.dispose()
 
 
 app = FastAPI(
@@ -30,8 +42,11 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-# D-03: no CORS middleware in production. Only the dev origins are allowed, and only for
-# the explicit local dev ports listed in DEV_ORIGINS.
+# D-03: the browser only ever talks to one origin -- Next.js rewrites /api/* to this
+# process -- so production needs no CORS at all and this middleware stays dormant.
+# Registered unconditionally anyway: it is what answers a dev preflight, and it is
+# what stops a stray cross-origin caller if port 8000 is ever exposed. Only the
+# origins in DEV_ORIGINS (localhost unless you widen it) are ever echoed back.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(settings.origin_allowlist),
@@ -72,4 +87,13 @@ for r in (auth.router, users.router, tasks.router, logs.router, audit_router.rou
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "app_timezone": settings.APP_TIMEZONE}
+    # `database` is the point of this endpoint for an operator: it is the one
+    # place that proves which engine the process actually connected to, so a
+    # misconfigured DATABASE_URL cannot hide behind a container that is merely
+    # "up". `database_url` is the redacted form -- see settings.safe_database_url.
+    return {
+        "status": "ok",
+        "app_timezone": settings.APP_TIMEZONE,
+        "database": settings.database_scheme,
+        "database_url": settings.safe_database_url,
+    }

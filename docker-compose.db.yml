@@ -1,0 +1,92 @@
+# Optional: run PostgreSQL as a container on this VPS, instead of pointing
+# DATABASE_URL at a database somewhere else (Contabo's bundled PostgreSQL, a
+# managed provider, or one installed on the host itself).
+#
+# This is an *override*, so it is always combined with the main file and never
+# used alone:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.db.yml up -d --build
+#
+# Why a second file rather than a `profiles:` entry on the `db` service in
+# docker-compose.yml: Compose interpolates every ${VAR:?...} in the file before it
+# looks at which services are active. A profile-gated `db` service would
+# therefore make the *main* file refuse to start unless you also set
+# POSTGRES_USER/POSTGRES_PASSWORD -- which would force every deployment, even
+# ones with an external database, to invent values for a service it never runs.
+#
+# Setting DATABASE_URL=postgresql+psycopg://USER:PASS@db:5432/taskssort in .env
+# is the other half of this. The host name is `db` because that is the service
+# name on the compose network; from inside the backend container, `localhost`
+# would mean the backend container itself.
+
+name: taskssort
+
+services:
+  backend:
+    # Wait for the database to actually accept connections before the first
+    # request, rather than for the container to merely be running.
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # No `ports:` at all -- not even a loopback bind. This database is reachable
+    # only from the compose network, which is the point: an internet-facing
+    # PostgreSQL is the most-scanned service there is. For a psql session, use
+    # `docker compose -f docker-compose.yml -f docker-compose.db.yml exec db psql ...`
+    expose:
+      - "5432"
+    environment:
+      # Required, with no defaults. A default password here would be a default
+      # password in production, and `initdb` also refuses an empty one.
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-taskssort}
+      # Fix the encoding and collation rather than inheriting them from whatever
+      # image is current, so ORDER BY on text sorts identically everywhere and
+      # a future postgres:16-point release cannot change the cluster's locale
+      # underneath you.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      # A named volume, not a bind mount. The data directory belongs to postgres
+      # (uid 999) inside the container, and a host directory owned by root makes
+      # the server refuse to start.
+      #
+      # `docker compose down` does NOT remove named volumes. `docker compose down
+      # -v` does. That single flag is the only thing standing between a routine
+      # cleanup command and the entire database -- see the backup section of
+      # PRODUCTION_DEPLOY.md.
+      - pgdata:/var/lib/postgresql/data
+      # Logical backups, inside the volume, so they live and die with the data
+      # they describe. Cron job is defined in PRODUCTION_DEPLOY.md.
+      - pgbackups:/backups
+    networks:
+      - taskssort
+    healthcheck:
+      # `pg_isready` alone goes green while initdb is still running, which is
+      # the classic first-deploy failure: "the database system is starting up".
+      # Making a real connection is what turns `condition: service_healthy`
+      # into "the backend can use this now".
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -q && psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -c 'SELECT 1' > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    # Long enough for a clean shutdown checkpoint rather than a crash-recovery
+    # replay on the next start.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # The only persistent database storage. See the warning on `docker compose
+  # down -v` above.
+  pgdata:
+    name: taskssort-pgdata
+  pgbackups:
+    name: taskssort-pgbackups
