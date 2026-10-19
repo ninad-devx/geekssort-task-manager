@@ -128,6 +128,16 @@ def apply_scope(stmt: Select, scope: str | None, carry_days: int = 7) -> Select:
             # Something somebody is actively working on belongs to today even
             # when its due date is next week or unset.
             and_(is_open, is_active),
+            # A task raised earlier today and not yet started is today's work.
+            # Without this, creating a task and refreshing made it vanish: it is
+            # To Do, it has no due date and nobody has touched it, so the Today
+            # scope reported nothing -- and the person reasonably read that as
+            # the task being lost.
+            and_(
+                Task.status == TaskStatus.todo.value,
+                Task.created_at >= day_start,
+                Task.created_at <= day_end,
+            ),
             # Plus whatever was actually finished today, so the day reads as a
             # closed loop rather than only the leftovers.
             and_(
@@ -142,11 +152,13 @@ def apply_scope(stmt: Select, scope: str | None, carry_days: int = 7) -> Select:
 def today_rank(carry_days: int = 7):
     """Ordering for `scope=today`: what needs a person first.
 
-    Overdue outranks actively-moved work, which outranks merely due-today, and
-    anything finished today sits at the bottom. Within a band the usual
-    urgency-then-due-date rule applies.
+    Overdue outranks actively-moved work, which outranks merely due-today, then
+    something raised earlier today and not yet started, and anything finished
+    today sits at the bottom. Within a band the usual urgency-then-due-date rule
+    applies.
     """
     today = local_today()
+    day_start, _ = today_bounds_utc()
     is_open = Task.status != TaskStatus.completed.value
     return case(
         (
@@ -160,7 +172,8 @@ def today_rank(carry_days: int = 7):
         ),
         (and_(is_open, Task.status.in_(ACTIVE_STATUSES)), 1),
         (and_(is_open, Task.due_date == today), 2),
-        else_=3,
+        (and_(Task.status == TaskStatus.todo.value, Task.created_at >= day_start), 3),
+        else_=4,
     )
 
 

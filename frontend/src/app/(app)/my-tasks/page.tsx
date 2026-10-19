@@ -68,7 +68,7 @@ const EMPTY_COPY: Record<ScopeKey, { title: string; description: string }> = {
 
 function MyTasksInner() {
   const params = useSearchParams();
-  const { capabilities } = useAuth();
+  const { capabilities, user } = useAuth();
   const client = useQueryClient();
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState("");
@@ -395,7 +395,20 @@ function MyTasksInner() {
         </>
       )}
 
-      <CreateTaskDialog open={createOpen} onClose={() => setCreateOpen(false)} onDone={invalidate} />
+      {/* A lead who raises a task from *their own* list means it for themselves
+          by default, but must still be able to hand it to somebody -- this is
+          the only create dialog on a page that is supposed to be about your
+          own work. Rendering it without `showAssignee` posted `assignee_id:
+          null`, so the task was created unassigned, vanished from a
+          Today-scoped list, and read as lost. */}
+      <CreateTaskDialog
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onDone={invalidate}
+        showAssignee={!!capabilities?.can_view_team}
+        lockAssignee={!capabilities?.can_view_team}
+        defaultAssignee={user?.id}
+      />
     </>
   );
 }

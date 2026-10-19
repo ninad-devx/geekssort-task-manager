@@ -29,15 +29,21 @@ import {
   formatReadable,
   todayLocal,
 } from "@/lib/format";
-import { EVENT_LABELS, type UserProfile, type WorklistRow } from "@/lib/types";
+import { EVENT_LABELS, STATUS_LABELS, type UserProfile, type WorklistRow } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+/**
+ * The calendar month to date.
+ *
+ * `days` counts today as one of the days, so on the 19th this is 19 -- the 1st
+ * through today, not a trailing 19 days that would reach back into last month.
+ */
 const RANGES = [
-  { value: 7, label: "Last 7 days" },
-  { value: 14, label: "Last 14 days" },
-  { value: 30, label: "Last 30 days" },
-  { value: 90, label: "Last 90 days" },
-];
+  { key: "month", label: "This month" },
+  { key: "7", label: "Last 7 days" },
+  { key: "30", label: "Last 30 days" },
+  { key: "90", label: "Last 90 days" },
+] as const;
 
 /**
  * One person, in full: who they are, what is on their plate right now, their
@@ -52,11 +58,14 @@ const RANGES = [
 export default function UserProfilePage({ params }: PageProps<"/users/[id]">) {
   const { id: rawId } = use(params);
   const userId = Number(rawId);
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<(typeof RANGES)[number]["key"]>("month");
+  const [openDay, setOpenDay] = useState<string | null>(null);
+
+  const days = range === "month" ? new Date().getDate() : Number(range);
 
   const profile = useQuery({
-    queryKey: ["profile", userId, days],
-    queryFn: () => api<UserProfile>(`/users/${userId}/profile${qs({ days })}`),
+    queryKey: ["profile", userId, days, openDay],
+    queryFn: () => api<UserProfile>(`/users/${userId}/profile${qs({ days, day: openDay ?? undefined })}`),
     enabled: Number.isFinite(userId),
   });
 
@@ -98,14 +107,17 @@ export default function UserProfilePage({ params }: PageProps<"/users/[id]">) {
               </Button>
             </Link>
             <Select
-              value={days}
-              onChange={(e) => setDays(Number(e.target.value))}
+              value={range}
+              onChange={(e) => {
+                setRange(e.target.value as (typeof RANGES)[number]["key"]);
+                setOpenDay(null);
+              }}
               aria-label="Activity window"
               className="h-10 w-auto rounded-full px-4"
             >
-              {RANGES.map((range) => (
-                <option key={range.value} value={range.value}>
-                  {range.label}
+              {RANGES.map((entry) => (
+                <option key={entry.key} value={entry.key}>
+                  {entry.label}
                 </option>
               ))}
             </Select>
@@ -203,11 +215,16 @@ export default function UserProfilePage({ params }: PageProps<"/users/[id]">) {
           <CardHeader>
             <CardTitle>Day-by-day activity</CardTitle>
             <p className="text-xs text-muted-foreground">
-              Every calendar day in the window, including the ones with nothing logged.
+              Every calendar day in the window, including the ones with nothing logged. Click a
+              date to see what happened on it.
             </p>
           </CardHeader>
           <CardContent>
-            <DayStrip daily={data.daily} />
+            <DayStrip
+              daily={data.daily}
+              openDay={openDay}
+              onPick={(day) => setOpenDay(openDay === day ? null : day)}
+            />
           </CardContent>
         </Card>
 
@@ -255,6 +272,10 @@ export default function UserProfilePage({ params }: PageProps<"/users/[id]">) {
           </CardContent>
         </Card>
       </div>
+
+      {openDay ? (
+        <DayDetail detail={data.day_detail} day={openDay} loading={profile.isFetching} />
+      ) : null}
 
       {/* Today's work, in priority order */}
       <div className="mt-5 grid gap-5 md:grid-cols-2">
@@ -307,11 +328,22 @@ function RunningNow({
 }
 
 /**
- * One bar per day. Days with no hours are drawn as a flat striped stub rather
- * than omitted -- a gap in the strip reads as "we lost the data", which is a
- * different and wrong claim from "nothing was logged that day".
+ * One bar per day, and the day opened underneath.
+ *
+ * Days with no hours are drawn as a flat striped stub rather than omitted -- a
+ * gap in the strip reads as "we lost the data", which is a different and wrong
+ * claim from "nothing was logged that day". Every bar is a button, so the
+ * strip answers *how much* and a click answers *what*.
  */
-function DayStrip({ daily }: { daily: UserProfile["daily"] }) {
+function DayStrip({
+  daily,
+  openDay,
+  onPick,
+}: {
+  daily: UserProfile["daily"];
+  openDay: string | null;
+  onPick: (day: string) => void;
+}) {
   if (daily.length === 0) {
     return <p className="py-8 text-center text-sm text-muted-foreground">No activity in range.</p>;
   }
@@ -322,16 +354,24 @@ function DayStrip({ daily }: { daily: UserProfile["daily"] }) {
     <div>
       <div
         className="flex items-end gap-1 overflow-x-auto pb-2"
-        role="img"
-        aria-label="Daily tracked hours and completed tasks"
+        role="group"
+        aria-label="Daily tracked hours and completed tasks. Select a day for detail."
       >
         {daily.map((d) => {
           const hours = d.seconds / 3600;
           const heightPct = d.seconds > 0 ? Math.max(8, Math.round((d.seconds / maxSeconds) * 100)) : 2;
+          const selected = openDay === d.day;
           return (
-            <div
+            <button
               key={d.day}
-              className="group flex min-w-[2rem] flex-1 flex-col items-center gap-1"
+              type="button"
+              onClick={() => onPick(d.day)}
+              aria-pressed={selected}
+              aria-label={`${formatDayLabel(d.day)}: ${formatDuration(d.seconds)} tracked, ${d.completed} completed. Select for detail.`}
+              className={cn(
+                "group flex min-w-[2rem] flex-1 flex-col items-center gap-1 rounded-lg p-0.5 transition-colors",
+                selected ? "bg-[#eaf4ef] ring-1 ring-[#145338]/40" : "hover:bg-muted/60",
+              )}
               title={`${formatDayLabel(d.day)}: ${formatDuration(d.seconds)} tracked, ${d.completed} completed`}
             >
               <div className="relative flex h-32 w-full items-end justify-center">
@@ -339,6 +379,7 @@ function DayStrip({ daily }: { daily: UserProfile["daily"] }) {
                   className={cn(
                     "w-full max-w-[26px] rounded-t-md transition-all",
                     hours > 0 ? "bg-[#1f7a52]" : "striped-bar",
+                    selected && hours > 0 && "bg-[#145338]",
                   )}
                   style={{ height: `${heightPct}%` }}
                 />
@@ -356,7 +397,7 @@ function DayStrip({ daily }: { daily: UserProfile["daily"] }) {
               <span className="text-[10px] font-medium text-muted-foreground">
                 {formatDayLabel(d.day).split(",")[0]}
               </span>
-            </div>
+            </button>
           );
         })}
       </div>
@@ -370,6 +411,131 @@ function DayStrip({ daily }: { daily: UserProfile["daily"] }) {
         </span>
       </div>
     </div>
+  );
+}
+
+/** What happened on the selected day: where the hours went, and what closed. */
+function DayDetail({
+  detail,
+  day,
+  loading,
+}: {
+  detail?: UserProfile["day_detail"] | null;
+  day: string;
+  loading: boolean;
+}) {
+  if (loading && !detail) {
+    return (
+      <Card className="mt-5">
+        <CardContent className="flex items-center gap-3 p-4 text-sm text-muted-foreground">
+          <Spinner label="" /> Loading {formatDayLabel(day)}…
+        </CardContent>
+      </Card>
+    );
+  }
+  if (!detail) return null;
+
+  const work = detail.entries.filter((e) => e.entry_type === "work_session");
+  const notes = detail.entries.filter((e) => e.entry_type === "note");
+
+  return (
+    <Card className="mt-5">
+      <CardHeader>
+        <CardTitle>{formatDayLabel(day)}</CardTitle>
+        <p className="text-xs text-muted-foreground">
+          {formatDuration(detail.seconds)} tracked across {work.length} entr
+          {work.length === 1 ? "y" : "ies"} · {detail.completed.length} task
+          {detail.completed.length === 1 ? "" : "s"} completed
+        </p>
+      </CardHeader>
+      <CardContent>
+        {detail.entries.length === 0 && detail.completed.length === 0 ? (
+          <p className="py-4 text-center text-sm text-muted-foreground">
+            Nothing logged or completed on this day.
+          </p>
+        ) : null}
+
+        {work.length > 0 ? (
+          <div className="mb-4">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Time logged
+            </p>
+            <ul className="flex flex-col gap-1.5">
+              {work.map((entry) => (
+                <li
+                  key={entry.log_id}
+                  className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm"
+                >
+                  <Badge variant="outline">{STATUS_LABELS[entry.task_status]}</Badge>
+                  <Link
+                    href={`/tasks/${entry.task_id}`}
+                    className="min-w-0 flex-1 truncate font-medium hover:text-[#145338] hover:underline"
+                  >
+                    {entry.task_title}
+                  </Link>
+                  <span className="tabular text-xs text-muted-foreground">
+                    {formatReadable(entry.started_at)}
+                  </span>
+                  <span className="tabular font-bold text-foreground">
+                    {formatDuration(entry.seconds)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {detail.completed.length > 0 ? (
+          <div className="mb-4">
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Completed
+            </p>
+            <ul className="flex flex-col gap-1.5">
+              {detail.completed.map((row) => (
+                <li
+                  key={row.id}
+                  className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm"
+                >
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[#1f7a52]" aria-hidden />
+                  <Link
+                    href={`/tasks/${row.id}`}
+                    className="min-w-0 flex-1 truncate font-medium hover:text-[#145338] hover:underline"
+                  >
+                    {row.title}
+                  </Link>
+                  {row.completed_at ? (
+                    <span className="tabular text-xs text-muted-foreground">
+                      {formatReadable(row.completed_at)}
+                    </span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        {notes.length > 0 ? (
+          <div>
+            <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Notes
+            </p>
+            <ul className="flex flex-col gap-1.5">
+              {notes.map((entry) => (
+                <li key={entry.log_id} className="rounded-lg bg-muted/50 px-3 py-2 text-sm">
+                  <Link
+                    href={`/tasks/${entry.task_id}`}
+                    className="font-medium hover:text-[#145338] hover:underline"
+                  >
+                    {entry.task_title}
+                  </Link>
+                  {entry.note ? <p className="mt-0.5 text-muted-foreground">{entry.note}</p> : null}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </CardContent>
+    </Card>
   );
 }
 

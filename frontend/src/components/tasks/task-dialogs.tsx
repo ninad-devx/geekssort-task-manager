@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -71,6 +71,16 @@ export function CreateTaskDialog({
   const [requiresReview, setRequiresReview] = useState(false);
   const [touched, setTouched] = useState(false);
 
+  // `defaultAssignee` has to become the *visible* selection, not just a fallback
+  // for the request. Sending the default while the picker reads "Unassigned"
+  // means the two disagree on screen and only the network gets to say what
+  // happened -- which is how a task ends up assigned to someone the creator
+  // never chose. Syncing on open also means the value tracks the signed-in user
+  // if the session arrives after the first render.
+  useEffect(() => {
+    if (open) setAssigneeId(defaultAssignee ? String(defaultAssignee) : "");
+  }, [open, defaultAssignee]);
+
   const directory = useQuery({
     queryKey: ["directory"],
     queryFn: () => api<DirectoryEntry[]>("/users/directory"),
@@ -88,7 +98,13 @@ export function CreateTaskDialog({
           category: category || null,
           due_date: dueDate || null,
           requires_review: requiresReview,
-          assignee_id: showAssignee && assigneeId ? Number(assigneeId) : (defaultAssignee ?? null),
+          // Only send what the picker actually shows. An empty string means the
+          // person chose Unassigned, and the server honours that for a lead.
+          assignee_id: showAssignee
+            ? assigneeId
+              ? Number(assigneeId)
+              : null
+            : (defaultAssignee ?? null),
         },
       }),
     onSuccess: async () => {
@@ -109,9 +125,10 @@ export function CreateTaskDialog({
     setDueDate("");
     setCategory("");
     setPriority("medium");
-    setAssigneeId("");
     setRequiresReview(false);
     setTouched(false);
+    // `assigneeId` is left alone: it is reset when the dialog next opens, and
+    // clearing it here would make the payload and the picker briefly disagree.
   };
 
   const showTitleError = touched && title.trim().length === 0;

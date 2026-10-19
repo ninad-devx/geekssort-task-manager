@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import delete, func, select
@@ -131,6 +131,10 @@ def user_profile(
     db: Session = Depends(get_db),
     days: int = Query(default=30, ge=1, le=90),
     carry_days: int = Query(default=7, ge=0, le=365),
+    day: date | None = Query(
+        default=None,
+        description="Also return what this person actually did on one calendar day.",
+    ),
 ):
     """One person's whole working picture: today's board, their totals, and a
     day-by-day activity strip.
@@ -285,6 +289,72 @@ def user_profile(
             for log in running
         ],
         "recent_activity": [audit_out(event) for event in recent],
+        "day_detail": _day_detail(db, target, day) if day is not None else None,
+    }
+
+
+def _day_detail(db: Session, target: User, day: date) -> dict:
+    """One calendar day, itemised: where the hours went and what closed.
+
+    The activity strip says *how much*; this answers *what*. Scoped to this
+    person's own time entries and their own tasks, so a lead opening a
+    colleague's day reads the same record the colleague reads.
+    """
+    from app.models import EntryType
+    from app.routers.dashboard import end_of_day_utc, start_of_day_utc
+    from app.serializers import elapsed
+
+    start, end = start_of_day_utc(day), end_of_day_utc(day)
+
+    rows = db.execute(
+        select(WorkSession, Task.title, Task.status, Task.id)
+        .join(Task, Task.id == WorkSession.task_id)
+        .where(
+            WorkSession.user_id == target.id,
+            WorkSession.deleted_at.is_(None),
+            WorkSession.started_at >= start,
+            WorkSession.started_at <= end,
+        )
+        .order_by(WorkSession.started_at.asc(), WorkSession.id.asc())
+    ).all()
+
+    entries = []
+    for log, task_title, task_status, task_id in rows:
+        entries.append(
+            {
+                "log_id": log.id,
+                "task_id": task_id,
+                "task_title": task_title,
+                "task_status": task_status,
+                "entry_type": log.entry_type,
+                "started_at": log.started_at,
+                "ended_at": log.ended_at,
+                "seconds": elapsed(log),
+                "note": log.note,
+            }
+        )
+
+    closed = db.execute(
+        select(Task.id, Task.title, Task.status, Task.completed_at)
+        .where(
+            Task.assignee_id == target.id,
+            Task.deleted_at.is_(None),
+            Task.completed_at >= start,
+            Task.completed_at <= end,
+        )
+        .order_by(Task.completed_at.asc())
+    ).all()
+
+    return {
+        "day": str(day),
+        "seconds": sum(
+            e["seconds"] for e in entries if e["entry_type"] == EntryType.work_session.value
+        ),
+        "entry_count": len(entries),
+        "entries": entries,
+        "completed": [
+            {"id": r[0], "title": r[1], "status": r[2], "completed_at": r[3]} for r in closed
+        ],
     }
 
 

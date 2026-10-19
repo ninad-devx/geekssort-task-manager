@@ -359,6 +359,31 @@ export interface UserProfile {
     is_stale: boolean;
   }[];
   recent_activity: AuditEvent[];
+  /** Present only when a `day` was requested: what this person did that day. */
+  day_detail?: UserDayDetail | null;
+}
+
+export interface UserDayDetail {
+  day: string;
+  seconds: number;
+  entry_count: number;
+  entries: {
+    log_id: number;
+    task_id: number;
+    task_title: string;
+    task_status: TaskStatus;
+    entry_type: "work_session" | "note";
+    started_at: string;
+    ended_at: string | null;
+    seconds: number;
+    note: string | null;
+  }[];
+  completed: {
+    id: number;
+    title: string;
+    status: TaskStatus;
+    completed_at: string | null;
+  }[];
 }
 
 export interface MemberLoad {
