@@ -133,8 +133,16 @@ def apply_scope(stmt: Select, scope: str | None, carry_days: int = 7) -> Select:
             # To Do, it has no due date and nobody has touched it, so the Today
             # scope reported nothing -- and the person reasonably read that as
             # the task being lost.
+            #
+            # Deliberately limited to *undated* tasks. A task whose due date has
+            # already passed is governed by the carry-forward window above, and
+            # letting "created today" rescue it would put the whole backlog back
+            # on the morning board -- which is the problem this scope exists to
+            # solve. A dated task is judged on its date, an undated one on when
+            # it was raised.
             and_(
                 Task.status == TaskStatus.todo.value,
+                Task.due_date.is_(None),
                 Task.created_at >= day_start,
                 Task.created_at <= day_end,
             ),
@@ -172,7 +180,14 @@ def today_rank(carry_days: int = 7):
         ),
         (and_(is_open, Task.status.in_(ACTIVE_STATUSES)), 1),
         (and_(is_open, Task.due_date == today), 2),
-        (and_(Task.status == TaskStatus.todo.value, Task.created_at >= day_start), 3),
+        (
+            and_(
+                Task.status == TaskStatus.todo.value,
+                Task.due_date.is_(None),
+                Task.created_at >= day_start,
+            ),
+            3,
+        ),
         else_=4,
     )
 

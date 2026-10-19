@@ -127,6 +127,29 @@ def test_yesterdays_new_task_is_not_todays_problem(client, users):
     assert t["id"] in [x["id"] for x in client.get("/api/tasks?mine=1&scope=open").json()["items"]]
 
 
+def test_a_dated_task_created_today_is_judged_on_its_date(client, users):
+    """The fix must not reopen the flood-gate it was meant to close.
+
+    "Created today, still To Do" is today's work only when there is no date to
+    judge it by. A task raised today with a due date a fortnight in the past is
+    somebody deliberately filing old work, and the carry-forward window is what
+    says it is not today's problem. Letting creation-date win here would put the
+    entire backlog back on the morning board.
+    """
+    login(client, "lead@x.com")
+    undated = _task(client, title="No date", assignee_id=users["lead"])
+    ancient = _task(
+        client,
+        title="Filed late",
+        assignee_id=users["lead"],
+        due_date=(date.today() - timedelta(days=60)).isoformat(),
+    )
+
+    ids = [x["id"] for x in client.get("/api/tasks?mine=1&scope=today").json()["items"]]
+    assert undated["id"] in ids
+    assert ancient["id"] not in ids
+
+
 # --- per-day activity on a profile -----------------------------------------
 
 def _today() -> str:

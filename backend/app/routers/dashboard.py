@@ -163,10 +163,12 @@ def _focus_stmt(stmt: Select, today: date, carry_days: int = 7) -> Select:
                 Task.due_date >= today - timedelta(days=carry_days),
             ),
             and_(is_open, Task.status.in_(ACTIVE_STATUSES)),
-            # Raised earlier today and not yet started. Keeps a freshly created
-            # task on the board it was created from.
+            # Raised earlier today and not yet started. Undated only -- see the note on
+            # the same rule in `app.routers.tasks.apply_scope`: a dated task is
+            # judged on its date, so this must not resurrect the backlog.
             and_(
                 Task.status == TaskStatus.todo.value,
+                Task.due_date.is_(None),
                 Task.created_at >= start_of_day_utc(today),
                 Task.created_at <= end_of_day_utc(today),
             ),
