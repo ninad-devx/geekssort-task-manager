@@ -133,6 +133,10 @@ class TimePersonTotal(BaseModel):
 class TimeSummaryOut(BaseModel):
     scope: str
     days: int
+    # The exact window that was summed. `days` alone is ambiguous once you read
+    # it back -- "30 days" could mean today backwards 30 days or the 30 calendar
+    # days ending today, and the page needs to say which it got.
+    range: dict[str, datetime] | None = None
     total_seconds: int
     people: list[TimePersonTotal]
 
@@ -260,10 +264,34 @@ class ReminderOut(BaseModel):
     message: str | None
     sent_at: datetime
 
+class StatusMove(BaseModel):
+    """One status this person may move this task to right now.
+
+    Resolved server-side from the workflow table rather than hardcoded in the
+    client: the UI used to have to know the state machine to offer anything, and
+    a client-side copy silently offers transitions the server rejects -- a button
+    that always fails with INVALID_TRANSITION. The extra flags say whether the
+    move needs a reason or a note, so the row can ask for it up front instead of
+    round-tripping to get a 409.
+    """
+
+    status: str
+    requires_reason: bool = False
+    requires_note: bool = False
+
+
 class TaskActor(BaseModel):
     id: int
     full_name: str
     role: str
+    # Carried here so a task row can render the same picture and the same link
+    # as the tracked-time page. They used to live only on the directory and the
+    # users endpoint, so an assignee had to be reduced to a bare name wherever a
+    # task was listed -- which is why "the profile shows on tracked time but not
+    # on the task list".
+    display_name: str | None = None
+    avatar_url: str | None = None
+    avatar_color: str | None = None
 
 
 class RunningTimer(BaseModel):
@@ -312,6 +340,9 @@ class TaskOut(BaseModel):
     # on this" instead of silently rendering somebody else's clock as theirs.
     other_runners: list[RunningTimer] = Field(default_factory=list)
     allowed_actions: list[str] = Field(default_factory=list)
+    # What this caller may move this task to, right now. Lets a list row offer
+    # the change inline instead of forcing a trip through the task page.
+    allowed_statuses: list[StatusMove] = Field(default_factory=list)
     log_count: int = 0
 
 
@@ -320,6 +351,26 @@ class TaskListOut(BaseModel):
     total: int
     page: int
     page_size: int
+    # Counts for the whole filtered set, not just this page. The KPI strip used
+    # to tally the twenty-five rows it happened to render and call the result
+    # "Matching Tasks", so page two onwards showed smaller and smaller numbers
+    # for the same query.
+    summary: TaskSummary | None = None
+
+
+class TaskSummary(BaseModel):
+    total: int
+    by_status: dict[str, int]
+    due_today: int
+    overdue: int
+    in_progress: int
+    blocked: int
+    completed_today: int
+    unassigned: int
+    # Overdue work too old to count as today's problem. Only set for
+    # `scope=today`, where it is the number the narrowed list left out.
+    older_overdue: int = 0
+    carry_days: int | None = None
 
 
 # --- logs ------------------------------------------------------------------

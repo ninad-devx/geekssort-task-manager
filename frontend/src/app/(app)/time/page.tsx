@@ -6,12 +6,13 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { PageHeader, roleLabel } from "@/components/app-shell";
-import { Avatar } from "@/components/avatar";
+import { Avatar, displayName } from "@/components/avatar";
 import { Card, CardContent, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
-import { Badge, Progress } from "@/components/ui/form";
+import { Badge, Progress, Select } from "@/components/ui/form";
 import { api, ApiError, qs } from "@/lib/api";
-import { formatDuration, formatHours } from "@/lib/format";
-import { STATUS_LABELS, type Role, type TaskStatus } from "@/lib/types";
+import { useAuth } from "@/lib/auth";
+import { formatDayLabel, formatDuration, formatHours } from "@/lib/format";
+import { STATUS_LABELS, type DirectoryEntry, type Role, type TaskStatus } from "@/lib/types";
 
 interface TimeTaskTotal {
   task_id: number;
@@ -31,17 +32,40 @@ interface TimePersonTotal {
 interface TimeSummary {
   scope: "self" | "company";
   days: number;
+  range?: { from: string; to: string } | null;
   total_seconds: number;
   people: TimePersonTotal[];
 }
 
+/**
+ * Today first.
+ *
+ * `days=1` is today alone -- the server counts today as one of the days, where
+ * the old arithmetic subtracted a full day and then truncated to UTC midnight,
+ * so even the shortest window was really "yesterday evening plus today".
+ */
+const RANGES = [
+  { value: 1, label: "Today" },
+  { value: 7, label: "Last 7 days" },
+  { value: 30, label: "Last 30 days" },
+  { value: 90, label: "Last 90 days" },
+];
+
 export default function TimePage() {
-  const [days, setDays] = useState(30);
+  const { capabilities } = useAuth();
+  const [days, setDays] = useState(1);
+  const [person, setPerson] = useState("");
   const [open, setOpen] = useState<Set<number>>(new Set());
 
+  const directory = useQuery({
+    queryKey: ["directory"],
+    queryFn: () => api<DirectoryEntry[]>("/users/directory"),
+    enabled: !!capabilities?.can_view_team,
+  });
+
   const summary = useQuery({
-    queryKey: ["time", "summary", days],
-    queryFn: () => api<TimeSummary>(`/time/summary${qs({ days })}`),
+    queryKey: ["time", "summary", days, person],
+    queryFn: () => api<TimeSummary>(`/time/summary${qs({ days, user_id: person })}`),
   });
 
   const toggle = (id: number) =>
@@ -65,8 +89,18 @@ export default function TimePage() {
   }
 
   const data = summary.data;
-  const isCompany = data.scope === "company";
+  // Once a single person is picked, the scope is no longer the company even for
+  // a lead -- the header must not keep claiming a company total it is not showing.
+  const isCompany = data.scope === "company" && !person;
+  const singlePerson = person ? (directory.data ?? []).find((d) => String(d.id) === person) : null;
   const totalSessions = data.people.reduce((acc, p) => acc + p.entry_count, 0);
+  const rangeLabel = RANGES.find((r) => r.value === days)?.label ?? `Last ${days} days`;
+
+  const scopeLabel = singlePerson
+    ? displayName(singlePerson)
+    : isCompany
+      ? "Company"
+      : "Your";
 
   return (
     <>
@@ -75,19 +109,38 @@ export default function TimePage() {
         description={
           isCompany
             ? "Totals per person, then per task. Open a person to see where their hours went."
-            : "Your own tracked time, task by task."
+            : "Your tracked time, task by task."
         }
         actions={
-          <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
-            aria-label="Tracked time range"
-            className="h-10 rounded-full border border-[#145338]/30 bg-card px-4 text-sm font-medium text-foreground shadow-2xs transition-colors hover:border-[#145338] focus:outline-none focus:ring-2 focus:ring-ring"
-          >
-            <option value={7}>Last 7 days</option>
-            <option value={30}>Last 30 days</option>
-            <option value={90}>Last 90 days</option>
-          </select>
+          <>
+            {capabilities?.can_view_team ? (
+              <Select
+                value={person}
+                onChange={(e) => setPerson(e.target.value)}
+                aria-label="Filter by person"
+                className="h-10 w-auto min-w-[9rem] rounded-full px-4"
+              >
+                <option value="">Everyone</option>
+                {(directory.data ?? []).map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {displayName(entry)}
+                  </option>
+                ))}
+              </Select>
+            ) : null}
+            <select
+              value={days}
+              onChange={(e) => setDays(Number(e.target.value))}
+              aria-label="Tracked time range"
+              className="h-10 rounded-full border border-[#145338]/30 bg-card px-4 text-sm font-medium text-foreground shadow-2xs transition-colors hover:border-[#145338] focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              {RANGES.map((range) => (
+                <option key={range.value} value={range.value}>
+                  {range.label}
+                </option>
+              ))}
+            </select>
+          </>
         }
       />
 
@@ -96,12 +149,12 @@ export default function TimePage() {
         <div className="flex items-center justify-between rounded-2xl p-5 hero-green-card shadow-[0_8px_24px_rgba(20,83,56,0.20)]">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wider text-white/80">
-              {isCompany ? "Company Total" : "Your Total"}
+              {scopeLabel} Total
             </p>
             <p className="mt-1 tabular text-4xl font-bold text-white">
               {formatHours(data.total_seconds)}
             </p>
-            <p className="mt-1 text-xs text-[#a9dfc2]">over the last {data.days} days</p>
+            <p className="mt-1 text-xs text-[#a9dfc2]">{rangeLabel.toLowerCase()}</p>
           </div>
           <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-white/15 text-white">
             <Clock className="h-5 w-5" aria-hidden />
@@ -137,7 +190,7 @@ export default function TimePage() {
 
       {data.people.length === 0 ? (
         <EmptyState
-          title="No tracked time yet"
+          title="No tracked time in this range"
           description={
             isCompany
               ? "Once somebody runs a timer, their hours appear here."
@@ -206,28 +259,39 @@ export default function TimePage() {
                   </button>
 
                   {expanded ? (
-                    <ul className="divide-y divide-border/60 border-t border-border/70 bg-muted/15 px-5 py-2">
-                      {person.tasks.map((task) => (
-                        <li
-                          key={task.task_id}
-                          className="flex flex-wrap items-center gap-3 py-2.5 text-sm"
+                    <>
+                      <div className="border-t border-border/70 bg-muted/15 px-5 py-2.5 text-xs text-muted-foreground">
+                        <Link
+                          href={`/users/${person.user.id}`}
+                          className="inline-flex items-center gap-1.5 rounded-full border border-[#145338]/25 bg-[#eaf4ef]/60 px-2.5 py-1 font-semibold text-[#145338] hover:bg-[#145338] hover:text-white"
                         >
-                          <Badge variant="outline">{STATUS_LABELS[task.task_status]}</Badge>
-                          <Link
-                            href={`/tasks/${task.task_id}`}
-                            className="min-w-0 flex-1 truncate font-semibold text-foreground hover:text-[#145338] hover:underline"
+                          <Avatar person={person.user} size="xs" />
+                          View {displayName(person.user)}&rsquo;s profile and daily activity
+                        </Link>
+                      </div>
+                      <ul className="divide-y divide-border/60 border-t border-border/70 bg-muted/15 px-5 py-2">
+                        {person.tasks.map((task) => (
+                          <li
+                            key={task.task_id}
+                            className="flex flex-wrap items-center gap-3 py-2.5 text-sm"
                           >
-                            {task.task_title}
-                          </Link>
-                          <span className="text-xs text-muted-foreground">
-                            {task.entry_count} session{task.entry_count === 1 ? "" : "s"}
-                          </span>
-                          <span className="tabular font-bold text-foreground">
-                            {formatDuration(task.seconds)}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
+                            <Badge variant="outline">{STATUS_LABELS[task.task_status]}</Badge>
+                            <Link
+                              href={`/tasks/${task.task_id}`}
+                              className="min-w-0 flex-1 truncate font-semibold text-foreground hover:text-[#145338] hover:underline"
+                            >
+                              {task.task_title}
+                            </Link>
+                            <span className="text-xs text-muted-foreground">
+                              {task.entry_count} session{task.entry_count === 1 ? "" : "s"}
+                            </span>
+                            <span className="tabular font-bold text-foreground">
+                              {formatDuration(task.seconds)}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
                   ) : null}
                 </CardContent>
               </Card>
@@ -235,6 +299,12 @@ export default function TimePage() {
           })}
         </div>
       )}
+
+      <p className="mt-6 text-xs text-muted-foreground">
+        Showing {rangeLabel.toLowerCase()}
+        {data.range?.from ? ` (${formatDayLabel(String(data.range.from).slice(0, 10))})` : ""}.
+        Open a person for their day-by-day history on their profile.
+      </p>
     </>
   );
 }

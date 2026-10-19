@@ -11,6 +11,7 @@ import {
   Search,
   Users,
 } from "lucide-react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
@@ -32,8 +33,16 @@ import {
   type TaskBoard,
   type TaskList,
 } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
+
+/** Today-first by default, matching My Tasks. `all` is the absence of a filter. */
+const SCOPES = [
+  { key: "today", label: "Today" },
+  { key: "open", label: "Open" },
+  { key: "all", label: "All" },
+] as const;
 
 function TeamTasksInner() {
   const router = useRouter();
@@ -59,6 +68,10 @@ function TeamTasksInner() {
     completed_from: params.get("completed_from") ?? "",
     completed_to: params.get("completed_to") ?? "",
     q: params.get("q") ?? "",
+    // Today-first, for the same reason My Tasks is: a board that opens on
+    // "everything ever raised, earliest due date first" leads with last week's
+    // leftovers and hides what today actually needs.
+    scope: params.get("scope") ?? "today",
   };
 
   const setFilter = (key: string, value: string) => {
@@ -91,6 +104,7 @@ function TeamTasksInner() {
       api<TaskList>(
         `/tasks${qs({
           ...filters,
+          scope: filters.scope === "all" ? undefined : filters.scope,
           page,
           page_size: PAGE_SIZE,
           include_deleted: deleted === "with" ? true : undefined,
@@ -106,6 +120,7 @@ function TeamTasksInner() {
       api<TaskBoard>(
         `/tasks/board${qs({
           ...filters,
+          scope: filters.scope === "all" ? undefined : filters.scope,
           include_completed: filters.completed_from || filters.completed_to ? true : undefined,
         })}`,
       ),
@@ -144,6 +159,29 @@ function TeamTasksInner() {
         description="Every task in the company, grouped by the person carrying it."
         actions={
           <>
+            <div
+              role="tablist"
+              aria-label="Task scope"
+              className="inline-flex rounded-full bg-muted p-0.5 text-sm"
+            >
+              {SCOPES.map((entry) => (
+                <button
+                  key={entry.key}
+                  type="button"
+                  role="tab"
+                  aria-selected={filters.scope === entry.key}
+                  onClick={() => setFilter("scope", entry.key === "all" ? "" : entry.key)}
+                  className={cn(
+                    "rounded-full px-3.5 py-1.5 font-medium transition-colors",
+                    filters.scope === entry.key
+                      ? "bg-card text-foreground shadow-2xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
             <Button variant="outline" onClick={() => setView(view === "board" ? "list" : "board")}>
               {view === "board" ? "Flat list" : "By person"}
             </Button>
@@ -338,41 +376,50 @@ function TeamTasksInner() {
               return (
                 <Card key={person.user.id} className="overflow-hidden transition-all hover:border-[#145338]/30">
                   <CardContent className="p-0">
-                    <button
-                      type="button"
-                      className="flex w-full flex-wrap items-center gap-3.5 px-5 py-4 text-left transition-colors hover:bg-muted/30"
-                      onClick={() => setOpenPerson(expanded ? null : person.user.id)}
-                      aria-expanded={expanded}
-                    >
-                      <Avatar person={person.user} size="md" />
-                      <span className="flex min-w-0 flex-col">
-                        <span className="font-bold text-foreground">{displayName(person.user)}</span>
-                        <span className="text-xs text-muted-foreground">
-                          {roleLabel(person.user.role)}
-                        </span>
+<button
+                    type="button"
+                    className="flex w-full flex-wrap items-center gap-3.5 px-5 py-4 text-left transition-colors hover:bg-muted/30"
+                    onClick={() => setOpenPerson(expanded ? null : person.user.id)}
+                    aria-expanded={expanded}
+                  >
+                    <Avatar person={person.user} size="md" />
+                    <span className="flex min-w-0 flex-col">
+                      <span className="font-bold text-foreground">{displayName(person.user)}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {roleLabel(person.user.role)}
                       </span>
-                      <span className="ml-auto flex flex-wrap items-center gap-2">
-                        {person.blocked_count > 0 ? (
-                          <Badge variant="warning">{person.blocked_count} blocked</Badge>
-                        ) : null}
-                        {person.overdue_count > 0 ? (
-                          <Badge variant="danger">{person.overdue_count} overdue</Badge>
-                        ) : null}
-                        <Badge variant="default">{person.open_count} open</Badge>
-                        {person.tracked_seconds > 0 ? (
-                          <span className="tabular rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
-                            {formatDuration(person.tracked_seconds)} tracked
-                          </span>
-                        ) : null}
-                        <span className="ml-1 flex h-7 w-7 items-center justify-center rounded-full bg-muted/80 text-muted-foreground">
-                          {expanded ? (
-                            <ChevronDown className="h-4 w-4" aria-hidden />
-                          ) : (
-                            <ChevronRight className="h-4 w-4" aria-hidden />
-                          )}
+                    </span>
+                    <span className="ml-auto flex flex-wrap items-center gap-2">
+                      {person.blocked_count > 0 ? (
+                        <Badge variant="warning">{person.blocked_count} blocked</Badge>
+                      ) : null}
+                      {person.overdue_count > 0 ? (
+                        <Badge variant="danger">{person.overdue_count} overdue</Badge>
+                      ) : null}
+                      <Badge variant="default">{person.open_count} open</Badge>
+                      {person.tracked_seconds > 0 ? (
+                        <span className="tabular rounded-md bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                          {formatDuration(person.tracked_seconds)} tracked
                         </span>
+                      ) : null}
+                      {/* The expander is a separate control from the profile
+                          link, so the two are not nested inside one button. */}
+                      <Link
+                        href={`/users/${person.user.id}`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="inline-flex items-center gap-1.5 rounded-full border border-[#145338]/25 bg-[#eaf4ef]/60 px-2.5 py-1 text-xs font-semibold text-[#145338] hover:bg-[#145338] hover:text-white"
+                      >
+                        Profile
+                      </Link>
+                      <span className="flex h-7 w-7 items-center justify-center rounded-full bg-muted/80 text-muted-foreground">
+                        {expanded ? (
+                          <ChevronDown className="h-4 w-4" aria-hidden />
+                        ) : (
+                          <ChevronRight className="h-4 w-4" aria-hidden />
+                        )}
                       </span>
-                    </button>
+                    </span>
+                  </button>
 
                     {expanded ? (
                       <ul className="border-t border-border/70 bg-muted/15">

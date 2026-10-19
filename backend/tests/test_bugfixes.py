@@ -253,7 +253,15 @@ def test_time_accruing_on_an_open_timer_is_reported(client, users):
 
     personal = client.get("/api/dashboard/personal?days=30").json()
     assert personal["counts"]["tracked_seconds"] > 10_000
-    assert personal["daily"] and personal["daily"][0]["seconds"] > 10_000
+    # The daily strip is one row per calendar day, oldest first, including the
+    # empty ones -- so the session's hours land on *today's* row, not on row 0.
+    from app.serializers import local_today
+
+    today_row = next(
+        d for d in personal["daily"] if d["day"] == str(local_today())
+    )
+    assert len(personal["daily"]) == 30
+    assert today_row["seconds"] > 10_000
 
     assert client.get("/api/dashboard/time-summary?days=30").json()["total_seconds"] > 10_000
 

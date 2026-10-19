@@ -14,6 +14,7 @@ import {
   Settings,
   ShieldCheck,
   Tags,
+  UserRound,
   Users,
 } from "lucide-react";
 import Link from "next/link";
@@ -49,10 +50,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const mode = capabilities?.can_view_executive_dashboard ? "executive" : "personal";
-  // Read cached or lightweight dashboard counts for the sidebar task badge
+  // Read cached or lightweight dashboard counts for the sidebar task badge.
+  // Asked for "today" so the number matches what the dashboard shows, and so
+  // both share one cached query instead of each fetching its own period.
   const dashSummary = useQuery({
-    queryKey: ["dashboard", mode, "week"],
-    queryFn: () => api<DashboardPayload>(`/dashboard/${mode}?period=week`),
+    queryKey: ["dashboard", mode, "today"],
+    queryFn: () => api<DashboardPayload>(`/dashboard/${mode}?period=today`),
     staleTime: 60_000,
   });
   const openCount = dashSummary.data?.counts.open;
@@ -108,6 +111,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     { href: "/time", label: "Tracked Time", icon: Clock, show: true },
     { href: "/activity", label: "Task Activity", icon: Activity, show: true },
     { href: "/workspace", label: "Workspace", icon: FolderKanban, show: true },
+    {
+      href: "/people",
+      label: "People",
+      icon: UserRound,
+      show: !!capabilities?.can_view_team,
+    },
   ].filter((item) => item.show);
 
   const adminItems: NavItem[] = [
@@ -272,11 +281,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="flex shrink-0 items-center gap-2.5 sm:gap-3">
               <NotificationBell />
               {user ? (
-                <button
-                  type="button"
-                  onClick={() => setProfileOpen(true)}
+                <Link
+                  href={`/users/${user.id}`}
                   className="flex items-center gap-2.5 rounded-full py-1 pl-1 pr-2 text-left transition-colors hover:bg-white/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  title="Your profile"
+                  title="Open your profile"
                 >
                   <Avatar person={user} size="md" />
                   <div className="hidden min-w-0 flex-col sm:flex">
@@ -289,10 +297,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                       </span>
                     </div>
                     <span className="truncate text-xs leading-tight text-muted-foreground">
-                      {user.email}
+                      View profile &amp; my work
                     </span>
                   </div>
-                </button>
+                </Link>
               ) : null}
             </div>
           </header>
@@ -498,6 +506,9 @@ function ProfileDialog({
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
+          <Link href={`/users/${user.id}`} onClick={onClose}>
+            <Button variant="ghost">View full profile</Button>
+          </Link>
           <Button onClick={() => void save()} loading={busy}>
             Save
           </Button>

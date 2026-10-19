@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app import audit, policy, timelog
+from app.aggregate import live_seconds_expr
+from app.config import settings
 from app.db import get_db, write_tx
 from app.deps import CurrentUser, get_current_user, require_admin
 from app.errors import conflict, forbidden, not_found, unprocessable
 from app.models import (
+    AuditEvent,
     EventType,
     Role,
     SessionRow,
@@ -29,6 +33,13 @@ from app.schemas import (
     UserUpdateIn,
 )
 from app.security import generate_temp_password, hash_password, validate_password, validate_url
+from app.serializers import (
+    audit_out,
+    elapsed,
+    is_stale,
+    local_today,
+    worklist_rows,
+)
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -111,6 +122,170 @@ def directory(current: CurrentUser = Depends(get_current_user), db: Session = De
         )
         for u in rows
     ]
+
+
+@router.get("/{user_id}/profile")
+def user_profile(
+    user_id: int,
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    days: int = Query(default=30, ge=1, le=90),
+    carry_days: int = Query(default=7, ge=0, le=365),
+):
+    """One person's whole working picture: today's board, their totals, and a
+    day-by-day activity strip.
+
+    Everyone may open their own. A CEO or team lead may open anyone's, which is
+    what makes the numbers on the executive cards drillable: a lead who reads
+    "42 hours" needs to land on *whose* 42 hours.
+
+    Object-level denial is a 404, not a 403, so member ids cannot be walked
+    (rule D-10) -- the same answer as asking for a task you cannot see.
+    """
+    target = db.get(User, user_id)
+    if target is None:
+        raise not_found("USER_NOT_FOUND", "User not found")
+    if target.id != current.user.id and not policy.can_view_all_tasks(current.user):
+        raise not_found("USER_NOT_FOUND", "User not found")
+
+    from app.routers.dashboard import _daily_activity, _window_local_days, end_of_day_utc, start_of_day_utc
+    from app.routers.tasks import ACTIVE_STATUSES
+
+    today = local_today()
+    start, end = start_of_day_utc(today - timedelta(days=days - 1)), end_of_day_utc(today)
+
+    tasks = select(Task).where(Task.deleted_at.is_(None), Task.assignee_id == target.id)
+
+    def count(*conditions) -> int:
+        return int(db.scalar(select(func.count()).select_from(tasks.where(*conditions).subquery())) or 0)
+
+    open_clause = Task.status != TaskStatus.completed.value
+    day_start, day_end = start_of_day_utc(today), end_of_day_utc(today)
+
+    by_status = {
+        status.value: count(Task.status == status.value) for status in TaskStatus
+    }
+    total_seconds = int(db.scalar(select(live_seconds_expr()).where(
+        WorkSession.user_id == target.id, WorkSession.deleted_at.is_(None)
+    )) or 0)
+
+    running = db.scalars(
+        select(WorkSession).where(
+            WorkSession.user_id == target.id,
+            WorkSession.ended_at.is_(None),
+            WorkSession.deleted_at.is_(None),
+        )
+    ).all()
+
+    # Recent trail: what this person actually did. Deliberately actor-based
+    # rather than "everything that happened to their tasks", so opening a
+    # profile can never surface a colleague's actions or a company-level record.
+    recent = db.scalars(
+        select(AuditEvent)
+        .where(AuditEvent.actor_id == target.id)
+        .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+        .limit(20)
+    ).all()
+
+    return {
+        "user": {
+            "id": target.id,
+            "full_name": target.full_name,
+            "display_name": target.display_name,
+            "avatar_url": target.avatar_url,
+            "avatar_color": target.avatar_color,
+            "role": target.role,
+            "is_active": target.is_active,
+            "can_review": target.can_review,
+            "is_admin": target.is_admin,
+            "created_at": target.created_at,
+        },
+        "is_self": target.id == current.user.id,
+        "server_time": utcnow(),
+        "app_timezone": settings.APP_TIMEZONE,
+        "days": days,
+        "range": {"from": start, "to": end},
+        "counts": {
+            "total": sum(by_status.values()),
+            "by_status": by_status,
+            "open": sum(by_status[s] for s in OPEN_STATUSES),
+            "in_progress": by_status[TaskStatus.in_progress.value],
+            "blocked": by_status[TaskStatus.blocked.value],
+            "in_review": by_status[TaskStatus.in_review.value],
+            "overdue": count(
+                Task.due_date.is_not(None),
+                Task.due_date < today,
+                Task.due_date >= today - timedelta(days=carry_days),
+                open_clause,
+            ),
+            "due_today": count(Task.due_date == today, open_clause),
+            # Older than the carry-forward window: real, but no longer today's
+            # problem. Shown separately so a small "overdue" number is honest.
+            "older_overdue": count(
+                Task.due_date.is_not(None),
+                Task.due_date < today,
+                Task.due_date < today - timedelta(days=carry_days),
+                open_clause,
+            ),
+            "carry_days": carry_days,
+            "completed_today": count(
+                Task.completed_at >= day_start, Task.completed_at <= day_end
+            ),
+            "completed_total": by_status[TaskStatus.completed.value],
+            "tracked_seconds": int(
+                db.scalar(
+                    select(live_seconds_expr()).where(
+                        WorkSession.user_id == target.id,
+                        WorkSession.deleted_at.is_(None),
+                        WorkSession.started_at >= start,
+                        WorkSession.started_at <= end,
+                    )
+                )
+                or 0
+            ),
+            "tracked_seconds_total": total_seconds,
+        },
+        "daily": _daily_activity(db, target.id, start, end),
+        "days_in_range": [str(d) for d in _window_local_days(start, end)],
+        "tasks": {
+            "in_progress": worklist_rows(
+                db, tasks.where(Task.status == TaskStatus.in_progress.value), today
+            ),
+            "overdue": worklist_rows(
+                db,
+                tasks.where(
+                    Task.due_date.is_not(None),
+                    Task.due_date < today,
+                    Task.due_date >= today - timedelta(days=carry_days),
+                    open_clause,
+                ),
+                today,
+            ),
+            "due_today": worklist_rows(db, tasks.where(Task.due_date == today, open_clause), today),
+            "completed_today": worklist_rows(
+                db,
+                tasks.where(
+                    Task.status == TaskStatus.completed.value,
+                    Task.completed_at >= day_start,
+                    Task.completed_at <= day_end,
+                ),
+                today,
+            ),
+        },
+        "active_statuses": list(ACTIVE_STATUSES),
+        "running": [
+            {
+                "log_id": log.id,
+                "task_id": log.task_id,
+                "task_title": task.title if (task := db.get(Task, log.task_id)) else "Task",
+                "started_at": log.started_at,
+                "elapsed_seconds": elapsed(log),
+                "is_stale": is_stale(log),
+            }
+            for log in running
+        ],
+        "recent_activity": [audit_out(event) for event in recent],
+    }
 
 
 @router.get("", response_model=list[UserOut])

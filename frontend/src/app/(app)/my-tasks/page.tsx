@@ -1,8 +1,18 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Clock, FolderKanban, Plus, Search, Sparkles } from "lucide-react";
-import { useState } from "react";
+import {
+  AlertTriangle,
+  CalendarCheck,
+  CheckCircle2,
+  Clock,
+  FolderKanban,
+  Plus,
+  Search,
+  Sparkles,
+} from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/app-shell";
@@ -15,23 +25,84 @@ import { api, ApiError, qs } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { todayLocal } from "@/lib/format";
 import { PRIORITY_LABELS, STATUS_LABELS, type Task, type TaskList } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
 
-export default function MyTasksPage() {
+/**
+ * Which question the list is answering.
+ *
+ * `today` is the default because that is what people mean when they open their
+ * own task list. The old default returned everything ever assigned and sorted by
+ * due date, which put a backlog from previous days above today's work -- so the
+ * page opened on yesterday and the day's actual work was nowhere in sight.
+ */
+const SCOPES = [
+  { key: "today", label: "Today" },
+  { key: "open", label: "Open" },
+  { key: "done", label: "Completed" },
+  { key: "all", label: "All" },
+] as const;
+
+type ScopeKey = (typeof SCOPES)[number]["key"];
+
+const SCOPE_HINTS: Record<ScopeKey, string> = {
+  today: "Overdue from earlier days, due today, and whatever is in flight — ordered by what needs you first.",
+  open: "Everything still to do, whatever its due date.",
+  done: "Everything you have finished.",
+  all: "Your entire history, newest first among equal due dates.",
+};
+
+const EMPTY_COPY: Record<ScopeKey, { title: string; description: string }> = {
+  today: {
+    title: "Nothing due today",
+    description: "No overdue work, nothing due today, and nothing in progress. Use Quick add if something just came up.",
+  },
+  open: { title: "Nothing open", description: "Every task assigned to you is finished." },
+  done: { title: "Nothing completed yet", description: "Finished tasks will collect here." },
+  all: {
+    title: "No tasks here",
+    description: "Use Quick add above to capture ad-hoc work, or ask your team lead to assign something.",
+  },
+};
+
+function MyTasksInner() {
+  const params = useSearchParams();
   const { capabilities } = useAuth();
   const client = useQueryClient();
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState("");
   const [priority, setPriority] = useState("");
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(params.get("q") ?? "");
   const [quickAdd, setQuickAdd] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
 
+  // Read the requested scope once, on mount. Other screens link in with
+  // `?scope=open` and expect to land on that view; from then on the tab strip
+  // owns it, so switching tabs never fights the URL or remounts the page.
+  const [scope, setScope] = useState<ScopeKey>(() => {
+    const requested = params.get("scope");
+    return requested === "open" || requested === "done" || requested === "all" ? requested : "today";
+  });
+
+  // "All" is the absence of a scope filter, so it is sent as no parameter at
+  // all rather than as a value the API would have to special-case.
+  const scopeParamValue = scope === "all" ? undefined : scope;
+
   const tasks = useQuery({
-    queryKey: ["tasks", "mine", page, status, priority, query],
+    queryKey: ["tasks", "mine", scope, page, status, priority, query],
     queryFn: () =>
-      api<TaskList>(`/tasks${qs({ mine: 1, page, page_size: PAGE_SIZE, status, priority, q: query })}`),
+      api<TaskList>(
+        `/tasks${qs({
+          mine: 1,
+          scope: scopeParamValue,
+          page,
+          page_size: PAGE_SIZE,
+          status,
+          priority,
+          q: query,
+        })}`,
+      ),
   });
 
   const invalidate = () => client.invalidateQueries({ queryKey: ["tasks"] });
@@ -47,18 +118,35 @@ export default function MyTasksPage() {
       toast.error(error instanceof ApiError ? error.message : "Could not add the task"),
   });
 
+  const changeScope = (next: ScopeKey) => {
+    setScope(next);
+    setPage(1);
+  };
+
   const today = todayLocal();
   const items = tasks.data?.items ?? [];
   const total = tasks.data?.total ?? 0;
-  const inProgressCount = items.filter((t) => t.status === "in_progress").length;
-  const completedCount = items.filter((t) => t.status === "completed").length;
-  const overdueCount = items.filter((t) => t.is_overdue).length;
+  const summary = tasks.data?.summary;
+  const inProgressCount = summary?.in_progress ?? items.filter((t) => t.status === "in_progress").length;
+  const overdueCount = summary?.overdue ?? items.filter((t) => t.is_overdue).length;
+  const dueTodayCount = summary?.due_today ?? 0;
+  const doneCount =
+    scope === "today" ? (summary?.completed_today ?? 0) : (summary?.by_status.completed ?? 0);
+
+  const heading =
+    scope === "today"
+      ? "Today"
+      : scope === "done"
+        ? "Completed"
+        : scope === "open"
+          ? "Open"
+          : "All";
 
   return (
     <>
       <PageHeader
         title="My Tasks"
-        description="Work assigned to you, plus anything you raised for yourself. Work you passed to someone else lives in Team Tasks."
+        description={SCOPE_HINTS[scope]}
         actions={
           capabilities?.can_create_tasks ? (
             <Button onClick={() => setCreateOpen(true)}>
@@ -69,11 +157,36 @@ export default function MyTasksPage() {
         }
       />
 
-      {/* Summary KPI Strip */}
+      {/* Scope strip. Today first, because that is the question people arrive with. */}
+      <div
+        role="tablist"
+        aria-label="Task scope"
+        className="mb-5 inline-flex flex-wrap rounded-full bg-muted p-0.5 text-sm"
+      >
+        {SCOPES.map((entry) => (
+          <button
+            key={entry.key}
+            type="button"
+            role="tab"
+            aria-selected={scope === entry.key}
+            onClick={() => changeScope(entry.key)}
+            className={cn(
+              "rounded-full px-4 py-1.5 font-medium transition-colors",
+              scope === entry.key
+                ? "bg-card text-foreground shadow-2xs"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {entry.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Summary KPI Strip — counts cover the whole filtered set, not one page. */}
       <div className="mb-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="flex items-center justify-between rounded-2xl p-5 hero-green-card shadow-[0_8px_24px_rgba(20,83,56,0.18)]">
           <div>
-            <p className="text-xs font-medium text-white/85">Matching Tasks</p>
+            <p className="text-xs font-medium text-white/85">{heading} Tasks</p>
             <p className="mt-1 tabular text-3xl font-bold text-white">{total}</p>
             <p className="mt-1 text-xs text-[#a9dfc2]">Assigned or raised by you</p>
           </div>
@@ -84,7 +197,7 @@ export default function MyTasksPage() {
 
         <Card className="flex items-center justify-between p-5">
           <div>
-            <p className="text-xs font-medium text-muted-foreground">In Progress (Page)</p>
+            <p className="text-xs font-medium text-muted-foreground">In Progress</p>
             <p className="mt-1 tabular text-3xl font-bold text-foreground">{inProgressCount}</p>
             <p className="mt-1 text-xs text-[#1f7a52]">Active workflow items</p>
           </div>
@@ -95,9 +208,13 @@ export default function MyTasksPage() {
 
         <Card className="flex items-center justify-between p-5">
           <div>
-            <p className="text-xs font-medium text-muted-foreground">Completed (Page)</p>
-            <p className="mt-1 tabular text-3xl font-bold text-foreground">{completedCount}</p>
-            <p className="mt-1 text-xs text-[#1f7a52]">Finished tasks</p>
+            <p className="text-xs font-medium text-muted-foreground">
+              {scope === "today" ? "Done Today" : "Completed"}
+            </p>
+            <p className="mt-1 tabular text-3xl font-bold text-foreground">{doneCount}</p>
+            <p className="mt-1 text-xs text-[#1f7a52]">
+              {scope === "today" ? "Finished today" : "Finished tasks"}
+            </p>
           </div>
           <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[#eaf4ef] text-[#145338]">
             <CheckCircle2 className="h-5 w-5" aria-hidden />
@@ -106,15 +223,17 @@ export default function MyTasksPage() {
 
         <Card className="flex items-center justify-between p-5">
           <div>
-            <p className="text-xs font-medium text-muted-foreground">Overdue (Page)</p>
+            <p className="text-xs font-medium text-muted-foreground">Needs Attention</p>
             <p
               className={`mt-1 tabular text-3xl font-bold ${
                 overdueCount > 0 ? "text-destructive" : "text-foreground"
               }`}
             >
-              {overdueCount}
+              {overdueCount + dueTodayCount}
             </p>
-            <p className="mt-1 text-xs text-muted-foreground">Past due date</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {overdueCount} overdue · {dueTodayCount} due today
+            </p>
           </div>
           <span
             className={`flex h-10 w-10 items-center justify-center rounded-2xl ${
@@ -123,10 +242,34 @@ export default function MyTasksPage() {
                 : "bg-[#eaf4ef] text-[#145338]"
             }`}
           >
-            <AlertTriangle className="h-5 w-5" aria-hidden />
+            {overdueCount > 0 ? (
+              <AlertTriangle className="h-5 w-5" aria-hidden />
+            ) : (
+              <CalendarCheck className="h-5 w-5" aria-hidden />
+            )}
           </span>
         </Card>
       </div>
+
+      {/* The today view deliberately leaves old slippage out so the day's real
+          work is visible. Say so, and make it one click away -- otherwise a
+          small number reads as "the backlog is gone". */}
+      {scope === "today" && (summary?.older_overdue ?? 0) > 0 ? (
+        <Card className="mb-5 border-[#f97316]/30 bg-[#fff7ed]">
+          <CardContent className="flex flex-wrap items-center gap-3 p-3.5 text-sm">
+            <AlertTriangle className="h-4 w-4 text-[#b45309]" aria-hidden />
+            <span className="min-w-0 flex-1 text-foreground">
+              <span className="font-semibold tabular">{summary?.older_overdue}</span> more
+              {summary?.older_overdue === 1 ? " task is" : " tasks are"} overdue by more than{" "}
+              {summary?.carry_days ?? 7} days. Left off today&rsquo;s board so the day&rsquo;s work
+              is visible.
+            </span>
+            <Button variant="outline" size="sm" onClick={() => changeScope("open")}>
+              View all open work
+            </Button>
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Quick Add Card */}
       {capabilities?.can_create_tasks ? (
@@ -158,7 +301,7 @@ export default function MyTasksPage() {
       {/* Filter Bar Card */}
       <Card className="mb-5 p-3.5">
         <div className="flex flex-wrap items-center gap-2.5">
-          <div className="relative min-w-[220px] flex-1 max-w-sm">
+          <div className="relative min-w-[220px] max-w-sm flex-1">
             <Search
               className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
               aria-hidden
@@ -203,7 +346,7 @@ export default function MyTasksPage() {
               </option>
             ))}
           </Select>
-          {status || priority || query ? (
+          {status || priority || query || scope !== "today" ? (
             <Button
               variant="ghost"
               size="sm"
@@ -211,6 +354,7 @@ export default function MyTasksPage() {
                 setStatus("");
                 setPriority("");
                 setQuery("");
+                changeScope("today");
                 setPage(1);
               }}
             >
@@ -224,16 +368,18 @@ export default function MyTasksPage() {
         <Spinner label="Loading your tasks" />
       ) : tasks.isError ? (
         <ErrorState
-          message={tasks.error instanceof ApiError ? tasks.error.message : "Could not load your tasks."}
+          message={
+            tasks.error instanceof ApiError ? tasks.error.message : "Could not load your tasks."
+          }
           onRetry={() => void tasks.refetch()}
         />
       ) : total === 0 ? (
         <EmptyState
-          title="No tasks here"
+          title={EMPTY_COPY[scope].title}
           description={
-            capabilities?.can_create_tasks
-              ? "Use Quick add above to capture ad-hoc work, or ask your team lead to assign something."
-              : "Nothing is assigned to you right now."
+            !capabilities?.can_create_tasks && scope === "today"
+              ? "Nothing is assigned to you right now."
+              : EMPTY_COPY[scope].description
           }
         />
       ) : (
@@ -251,5 +397,13 @@ export default function MyTasksPage() {
 
       <CreateTaskDialog open={createOpen} onClose={() => setCreateOpen(false)} onDone={invalidate} />
     </>
+  );
+}
+
+export default function MyTasksPage() {
+  return (
+    <Suspense fallback={<Spinner label="Loading your tasks" />}>
+      <MyTasksInner />
+    </Suspense>
   );
 }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import date, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app import aggregate, policy
@@ -26,6 +26,7 @@ from app.schemas import (
     LogOut,
     PersonRef,
     RunningTimer,
+    StatusMove,
     TaskActor,
     TaskOut)
 
@@ -33,7 +34,14 @@ from app.schemas import (
 def actor_out(user: User | None) -> TaskActor | None:
     if user is None:
         return None
-    return TaskActor(id=user.id, full_name=user.full_name, role=user.role)
+    return TaskActor(
+        id=user.id,
+        full_name=user.full_name,
+        role=user.role,
+        display_name=user.display_name,
+        avatar_url=user.avatar_url,
+        avatar_color=user.avatar_color,
+    )
 
 
 def _json(value: str | None) -> dict | None:
@@ -80,6 +88,55 @@ class TaskContext:
         self.mine = aggregate.running_by_task_for_user(db, ids, user.id)
         self.tracked = aggregate.tracked_seconds_by_task(db, ids)
         self.log_counts = aggregate.log_counts_by_task(db, ids)
+
+
+def allowed_status_moves(user: User, task: Task) -> list[StatusMove]:
+    """Statuses this caller may move this task to right now, in board order.
+
+    The state machine in `app.workflow` is the single source of truth. Repeating
+    it in the client is how a row ends up offering "Complete" on a task that is
+    still To Do, or on one flagged for review that only a reviewer may approve --
+    the click then fails with INVALID_TRANSITION or REVIEW_REQUIRED and the
+    person is worse off than before.
+    """
+    from app import workflow
+
+    if task.deleted_at is not None:
+        return []
+    if not policy.can_change_status(user, task):
+        return []
+
+    is_assignee = task.assignee_id == user.id
+    reviewer = policy.is_reviewer(user)
+    lead = policy.is_lead(user)
+    moves = []
+    for (src, dst), rule in workflow.TRANSITIONS.items():
+        if src != task.status:
+            continue
+        # Withdrawing a submission is the assignee's own move, unless the
+        # reviewer is the one sending it back for revision.
+        if not reviewer and (src, dst) == (
+            TaskStatus.in_review.value,
+            TaskStatus.in_progress.value,
+        ) and not is_assignee:
+            continue
+        # A task flagged for review is completed by a reviewer or a lead only.
+        if (
+            dst == TaskStatus.completed.value
+            and task.requires_review
+            and not (reviewer or lead)
+        ):
+            continue
+        moves.append(
+            StatusMove(
+                status=dst,
+                requires_reason=rule.requires_reason,
+                requires_note=rule.requires_note,
+            )
+        )
+    order = [s.value for s in TaskStatus]
+    moves.sort(key=lambda m: order.index(m.status))
+    return moves
 
 
 def running_timer_out(task: Task, log: WorkSession, viewer_id: int, now) -> RunningTimer:
@@ -268,6 +325,7 @@ def task_out(
         running=run_block,
         other_runners=others,
         allowed_actions=task_allowed_actions(user, task, db, now, ctx) if with_actions else [],
+        allowed_statuses=allowed_status_moves(user, task) if with_actions else [],
         log_count=ctx.log_counts.get(task.id, 0),
     )
 
@@ -351,6 +409,63 @@ def link_out(user: User, link: ResourceLink) -> LinkOut:
         updated_at=link.updated_at,
         allowed_actions=actions,
     )
+
+
+# --- worklists -------------------------------------------------------------
+
+def worklist_rows(db: Session, stmt: Select, today: date, limit: int = 25) -> list[dict]:
+    """Compact task rows for the dashboard's section cards.
+
+    Shared by the dashboards and the per-user profile so the two cannot drift:
+    a profile that listed work differently from the dashboard it links to would
+    be the same "the number and the rows disagree" bug in a new place.
+
+    The assignee is returned as a full `PersonRef`, not a bare name, so every
+    surface that names a person can also link to their profile.
+    """
+    sub = stmt.subquery().alias("t")
+    rows = db.execute(
+        select(
+            sub.c.id,
+            sub.c.title,
+            sub.c.status,
+            sub.c.due_date,
+            sub.c.priority,
+            User.id,
+            User.full_name,
+            User.display_name,
+            User.avatar_url,
+            User.avatar_color,
+            User.role,
+        )
+        .select_from(sub.outerjoin(User, User.id == sub.c.assignee_id))
+        .where(sub.c.deleted_at.is_(None))
+        .order_by(sub.c.due_date.is_(None), sub.c.due_date.asc(), sub.c.id.asc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": r[0],
+            "title": r[1],
+            "status": r[2],
+            "due_date": str(r[3]) if r[3] else None,
+            "priority": r[4],
+            "is_overdue": bool(r[3]) and r[3] < today,
+            "assignee": (
+                PersonRef(
+                    id=r[5],
+                    full_name=r[6],
+                    display_name=r[7],
+                    avatar_url=r[8],
+                    avatar_color=r[9],
+                    role=r[10],
+                )
+                if r[5] is not None
+                else None
+            ),
+        }
+        for r in rows
+    ]
 
 
 def folder_counts(db: Session, folder_ids: list[int]) -> dict[int, dict[str, int]]:

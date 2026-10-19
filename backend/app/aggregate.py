@@ -16,6 +16,8 @@ whole page in one query each.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from sqlalchemy import case, func, literal_column, select
 from sqlalchemy.orm import Session
 
@@ -62,6 +64,50 @@ def live_seconds(ended_at_col, started_at_col) -> case:
 
 
 LIVE_SECONDS = live_seconds(WorkSession.ended_at, WorkSession.started_at)
+
+
+def local_date_expr(col):
+    """The calendar date of a naive-UTC timestamp, in APP_TIMEZONE.
+
+    `func.date(col)` buckets by the *database's* day. Every stored timestamp is
+    naive UTC, so on a server set to UTC that split the day at 00:00 UTC -- six
+    hours before midnight in Asia/Dhaka. A session started at 1am on Tuesday
+    local time landed in Monday's bar, which is why "today's hours" read as
+    yesterday's and vice versa, and why the day labels were off by a fraction of
+    the team.
+
+    Both dialects go through the same two steps: read the naive value as an
+    instant, then project it into the app zone. The UTC offset for the SQLite
+    modifier is resolved in Python from `settings.tz`, so the two branches agree
+    by construction. A zone that observes DST would need a per-row offset for the
+    SQLite branch to stay exact across a window spanning a transition;
+    PostgreSQL handles that itself. `APP_TIMEZONE` is a single configured zone.
+    """
+    if settings.is_sqlite:
+        # `tz.utcoffset(None)` returns None for ZoneInfo -- the tzinfo protocol
+        # wants a datetime, and a naive one is interpreted as wall time in the
+        # zone. Falling back to zero here looks like it works (UTC has no shift)
+        # and silently buckets every row by the *UTC* day on any other zone.
+        offset = datetime.now(settings.tz).utcoffset() or timedelta(0)
+        total_minutes = int(offset.total_seconds() // 60)
+        sign = "+" if total_minutes >= 0 else "-"
+        magnitude = abs(total_minutes)
+        modifier = f"{sign}{magnitude // 60:02d}:{magnitude % 60:02d}"
+        # A bare offset modifier reads the stored naive value as UTC and shifts
+        # it. Do NOT add SQLite's 'utc' modifier alongside it: 'utc' converts
+        # local -> UTC, which cancels the shift and silently returns the UTC
+        # date -- the exact bug this function exists to prevent.
+        return func.date(col, modifier)
+    # `timezone('UTC', <timestamp without time zone>)` yields the instant;
+    # `timezone(<zone>, <timestamptz>)` yields that instant's local wall time.
+    # The zone must be inlined as a SQL literal -- bound as a parameter it
+    # arrives as `unknown` and PostgreSQL cannot resolve the overload.
+    return func.date(
+        func.timezone(
+            literal_column(f"'{settings.APP_TIMEZONE}'"),
+            func.timezone(literal_column("'UTC'"), col),
+        )
+    )
 
 
 def _not_deleted():

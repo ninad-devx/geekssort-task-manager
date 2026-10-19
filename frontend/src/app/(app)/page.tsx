@@ -18,7 +18,7 @@ import {
 } from "@/components/dashboard-widgets";
 import { CreateTaskDialog } from "@/components/tasks/task-dialogs";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle, EmptyState, ErrorState, Spinner } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle, ErrorState, Spinner } from "@/components/ui/card";
 import { Badge } from "@/components/ui/form";
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -35,7 +35,10 @@ export default function DashboardPage() {
   const client = useQueryClient();
 
   const mode = capabilities?.can_view_executive_dashboard ? "executive" : "personal";
-  const [period, setPeriod] = useState("week");
+  // Today, not the last seven days. "Dashboard" is the page people open first
+  // thing; opening it on a rolling week meant the completed and tracked-hour
+  // cards were describing yesterday while the page read as if it were today.
+  const [period, setPeriod] = useState("today");
   const [createOpen, setCreateOpen] = useState(false);
 
   const data = useQuery({
@@ -45,11 +48,13 @@ export default function DashboardPage() {
     refetchIntervalInBackground: false,
   });
 
-  // Fetch recent open tasks for the right-column Tasks widget when in executive mode
-  // (personal mode already includes `payload.worklists`)
+  // Fetch today's tasks for the right-column Tasks widget when in executive mode
+  // (personal mode already includes `payload.worklists`). Scoped to today for
+  // the same reason the cards are: an unsorted-by-recency page of everything ever
+  // raised put last week's leftovers at the top of the CEO's dashboard.
   const recentTasks = useQuery({
-    queryKey: ["tasks", "dashboard-recent", mode],
-    queryFn: () => api<TaskList>("/tasks?page=1&page_size=6&sort=due&order=asc"),
+    queryKey: ["tasks", "dashboard-recent", mode, period],
+    queryFn: () => api<TaskList>(`/tasks?page=1&page_size=8&scope=today`),
     enabled: mode === "executive",
     staleTime: 30_000,
   });
@@ -91,13 +96,17 @@ export default function DashboardPage() {
   const payload = data.data;
   if (!payload) return <Spinner label="Loading dashboard" />;
   const counts = payload.counts;
-  const isEmpty = counts.total === 0;
   const isCompany = mode === "executive";
   const lists = payload.worklists;
 
   // A CEO/lead reading a company-wide number must land on the company list.
-  // Pointing them at "My Tasks" silently shows them their own work instead.
+  // Pointing them at "/my Tasks" silently shows them their own work instead.
   const taskListBase = isCompany ? "/team-tasks" : "/my-tasks";
+
+  // Under "Today" the totals are today's focus set, so the cards link to the
+  // same narrowed list. Without `scope` they would land on every task ever
+  // raised and the number on the card would not match the rows.
+  const scopeParam = counts.scope === "today" ? "scope=today" : "";
 
   // The card says "completed today" when the period is today, so the list it
   // opens has to be filtered to the same window or the number and the rows
@@ -105,11 +114,12 @@ export default function DashboardPage() {
   // filter the API filters on.
   const range = payload.range;
   const completedWindow =
-    period === "today" && range
+    range && period !== "week"
       ? `&completed_from=${String(range.from).slice(0, 10)}&completed_to=${String(range.to).slice(0, 10)}`
-      : period !== "week" && range
-        ? `&completed_from=${String(range.from).slice(0, 10)}&completed_to=${String(range.to).slice(0, 10)}`
-        : "";
+      : "";
+
+  const periodLabel = payload.period_label ?? "the selected period";
+  const isToday = counts.scope === "today";
 
   const invalidateAll = () => {
     void client.invalidateQueries({ queryKey: ["dashboard"] });
@@ -136,7 +146,7 @@ export default function DashboardPage() {
     <>
       <PageHeader
         title={title}
-        description={`Plan, prioritize, and accomplish your tasks with ease · ${payload.period_label ?? "the selected period"}`}
+        description={`Plan, prioritize, and accomplish your tasks with ease · ${periodLabel}`}
         actions={
           <>
             {capabilities?.can_create_tasks ? (
@@ -164,35 +174,27 @@ export default function DashboardPage() {
         }
       />
 
-      {isEmpty && mode === "personal" ? (
-        <EmptyState
-          title="No tasks assigned to you yet"
-          description="Once your team lead assigns work, or you add a task for yourself, it will show up here."
-          action={
-            capabilities?.can_create_tasks ? (
-              <Button className="mt-2" onClick={() => setCreateOpen(true)}>
-                Create the first task
-              </Button>
-            ) : null
-          }
-        />
-      ) : (
-        <>
-          {/* Row 1: 4 Donezo-inspired Statistics Cards */}
+      <>
+          {/* Row 1: 4 Donezo-inspired Statistics Cards. Under "Today" each of
+              these counts today's work only, and says so on its face. */}
           <div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard
               featured
-              label="Total Tasks"
+              label={isToday ? "Today's Tasks" : "Total Tasks"}
               value={counts.total}
               badgeText={`${counts.open} open`}
-              hint="Active across workspace"
-              href={taskListBase}
+              hint={isToday ? "Overdue, due today, and in flight" : "Active across workspace"}
+              href={`${taskListBase}${scopeParam ? `?${scopeParam}` : ""}`}
             />
             <StatCard
               label="Completed Tasks"
               value={counts.completed_in_range}
-              badgeText={`${counts.by_status.completed ?? 0} total`}
-              hint={`Finished ${payload.period_label ?? "in range"}`}
+              badgeText={
+                counts.all_time_total !== undefined && counts.all_time_total > counts.total
+                  ? `${counts.all_time_total} all time`
+                  : undefined
+              }
+              hint={`Finished ${periodLabel}`}
               href={`${taskListBase}?status=completed${completedWindow}`}
               tone="success"
             />
@@ -214,9 +216,13 @@ export default function DashboardPage() {
               hint={
                 counts.overdue > 0
                   ? `${counts.due_today} due today`
-                  : isCompany
-                    ? "Company hours in range"
-                    : "Your hours in range"
+                  : isToday
+                    ? isCompany
+                      ? "Company hours today"
+                      : "Your hours today"
+                    : isCompany
+                      ? "Company hours in range"
+                      : "Your hours in range"
               }
               href="/time"
               tone={counts.overdue > 0 ? "danger" : "default"}
@@ -302,8 +308,7 @@ export default function DashboardPage() {
               <TaskSection title="Completed" tone="success" rows={lists.completed} />
             </div>
           ) : null}
-        </>
-      )}
+      </>
 
       {capabilities?.can_create_tasks ? (
         <CreateTaskDialog
@@ -367,8 +372,22 @@ function TaskSection({
         <ul className="flex flex-col gap-2.5">
           {rows.map((row) => (
             <li key={row.id} className="flex flex-wrap items-center gap-2 text-sm">
-              {row.assignee ? <Avatar person={row.assignee} size="xs" /> : null}
-              <Link href={`/tasks/${row.id}`} className="min-w-0 flex-1 font-medium hover:underline">
+              {row.assignee ? (
+                <Link
+                  href={`/users/${row.assignee.id}`}
+                  className="inline-flex min-w-0 items-center gap-1.5 rounded-full py-0.5 pr-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-[#145338]"
+                  title={`Open ${displayName(row.assignee)}'s profile`}
+                >
+                  <Avatar person={row.assignee} size="xs" />
+                  <span className="max-w-[9rem] truncate font-medium">{displayName(row.assignee)}</span>
+                </Link>
+              ) : (
+                <span className="text-xs text-muted-foreground">Unassigned</span>
+              )}
+              <Link
+                href={`/tasks/${row.id}`}
+                className="min-w-0 flex-1 font-medium hover:underline"
+              >
                 {row.title}
               </Link>
               {row.is_overdue ? (
@@ -376,11 +395,6 @@ function TaskSection({
               ) : row.due_date ? (
                 <span className="text-xs text-muted-foreground">due {row.due_date}</span>
               ) : null}
-              {row.assignee ? (
-                <span className="text-xs text-muted-foreground">{displayName(row.assignee)}</span>
-              ) : (
-                <span className="text-xs text-muted-foreground">Unassigned</span>
-              )}
             </li>
           ))}
         </ul>

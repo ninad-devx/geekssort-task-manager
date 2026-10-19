@@ -640,6 +640,16 @@ export function AttentionCard({
           </div>
         </div>
 
+        {/* Under "Today" the overdue figure covers a seven-day carry-forward
+            window. Say what fell outside it, or the small number reads as
+            "the backlog is gone". */}
+        {(counts.older_overdue ?? 0) > 0 ? (
+          <p className="text-xs text-muted-foreground">
+            <span className="tabular font-semibold text-foreground">{counts.older_overdue}</span>{" "}
+            further overdue beyond {counts.carry_days ?? 7} days are not counted above.
+          </p>
+        ) : null}
+
         <Link
           href={
             featuredTask
@@ -926,8 +936,9 @@ export function TeamCollaborationCard({
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <Link
-                            href={`/team-tasks?assignee_id=${member.user.id}`}
+                            href={`/users/${member.user.id}`}
                             className="truncate text-sm font-semibold text-foreground hover:text-[#145338] hover:underline"
+                            title={`Open ${displayName(member.user)}'s profile`}
                           >
                             {displayName(member.user)}
                           </Link>
@@ -955,7 +966,7 @@ export function TeamCollaborationCard({
                               <span className="tabular">
                                 {formatDuration(member.tracked_seconds)}
                               </span>{" "}
-                              tracked in range
+                              tracked {payload.counts.scope === "today" ? "today" : "in range"}
                             </>
                           )}
                         </p>
@@ -970,6 +981,19 @@ export function TeamCollaborationCard({
                       ) : (
                         <Badge variant="muted">Clear</Badge>
                       )}
+                      {/* Overdue counts are per person now, so a lead can see
+                          who is slipping without opening every profile. */}
+                      {(member.overdue_count ?? 0) > 0 ? (
+                        <Badge variant="danger">{member.overdue_count} overdue</Badge>
+                      ) : (member.due_today_count ?? 0) > 0 ? (
+                        <Badge variant="outline">{member.due_today_count} due today</Badge>
+                      ) : null}
+                      <Link
+                        href={`/users/${member.user.id}`}
+                        className="rounded-full border border-[#145338]/25 bg-[#eaf4ef]/60 px-2.5 py-0.5 text-xs font-semibold text-[#145338] hover:bg-[#145338] hover:text-white"
+                      >
+                        Profile
+                      </Link>
                     </div>
                   </li>
                 );

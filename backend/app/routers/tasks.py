@@ -27,10 +27,12 @@ from app.schemas import (
     TaskCreateIn,
     TaskListOut,
     TaskOut,
+    TaskSummary,
     TaskUpdateIn,
 )
 from app.security import escape_like, validate_evidence_url
 from app.serializers import TaskContext, is_overdue, local_today, task_out, tracked_seconds
+from app.timelog import to_utc
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -48,6 +50,17 @@ SortKey = Literal["due", "created", "updated", "title", "priority", "status"]
 SortOrder = Literal["asc", "desc"]
 StatusFilter = Literal["todo", "in_progress", "blocked", "in_review", "completed"]
 PriorityFilter = Literal["low", "medium", "high", "urgent"]
+# `scope` narrows the list to a question rather than to a field value. `today` is
+# the one people mean when they open "My Tasks": what is on my plate right now.
+ScopeFilter = Literal["today", "open", "done"]
+
+# Work that is genuinely in flight. These count as "today's work" whatever their
+# due date says, because somebody is on them right now.
+ACTIVE_STATUSES = (
+    TaskStatus.in_progress.value,
+    TaskStatus.blocked.value,
+    TaskStatus.in_review.value,
+)
 
 SORT_COLUMNS = {
     "due": Task.due_date,
@@ -56,6 +69,99 @@ SORT_COLUMNS = {
     "title": Task.title,
     "status": Task.status,
 }
+
+
+def today_bounds_utc() -> tuple[datetime, datetime]:
+    """Midnight and end of today in APP_TIMEZONE, as naive UTC datetimes.
+
+    `completed_at` and friends are stored as naive UTC, so a local calendar day
+    has to be converted before it can be compared against them.
+    """
+    from datetime import timezone
+
+    today = local_today()
+    tz = settings.tz
+    start_local = datetime.combine(today, datetime.min.time(), tzinfo=tz)
+    end_local = datetime.combine(today, datetime.max.time(), tzinfo=tz)
+    return (
+        start_local.astimezone(timezone.utc).replace(tzinfo=None),
+        end_local.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+def apply_scope(stmt: Select, scope: str | None, carry_days: int = 7) -> Select:
+    """Restrict the list to a working question.
+
+    The default (no scope) is untouched: every task, sorted as before. `today`
+    exists because the flat list sorted by due date put a backlog from last week
+    directly above the work actually due today, so the first screen a person saw
+    on "My Tasks" was yesterday's leftovers and today's work was nowhere to be
+    seen.
+
+    Overdue work carries forward, but only as far back as `carry_days`. A task
+    that slipped yesterday belongs on today's board; one that slipped in March is
+    a backlog problem, and letting it sit at the top of every morning's list is
+    what buried the day's real work in the first place. Anything older is still
+    counted (`summary.older_overdue`) and still one click away behind `open`, so
+    nothing is hidden -- it is just no longer pretending to be today's problem.
+    """
+    if scope == "open":
+        return stmt.where(Task.status != TaskStatus.completed.value)
+    if scope == "done":
+        return stmt.where(Task.status == TaskStatus.completed.value)
+    if scope != "today":
+        return stmt
+
+    today = local_today()
+    day_start, day_end = today_bounds_utc()
+    is_open = Task.status != TaskStatus.completed.value
+    is_active = Task.status.in_(ACTIVE_STATUSES)
+    return stmt.where(
+        or_(
+            # Overdue, within the carry-forward window.
+            and_(
+                is_open,
+                Task.due_date.is_not(None),
+                Task.due_date <= today,
+                Task.due_date >= today - timedelta(days=carry_days),
+            ),
+            # Something somebody is actively working on belongs to today even
+            # when its due date is next week or unset.
+            and_(is_open, is_active),
+            # Plus whatever was actually finished today, so the day reads as a
+            # closed loop rather than only the leftovers.
+            and_(
+                Task.status == TaskStatus.completed.value,
+                Task.completed_at >= day_start,
+                Task.completed_at <= day_end,
+            ),
+        )
+    )
+
+
+def today_rank(carry_days: int = 7):
+    """Ordering for `scope=today`: what needs a person first.
+
+    Overdue outranks actively-moved work, which outranks merely due-today, and
+    anything finished today sits at the bottom. Within a band the usual
+    urgency-then-due-date rule applies.
+    """
+    today = local_today()
+    is_open = Task.status != TaskStatus.completed.value
+    return case(
+        (
+            and_(
+                is_open,
+                Task.due_date.is_not(None),
+                Task.due_date < today,
+                Task.due_date >= today - timedelta(days=carry_days),
+            ),
+            0,
+        ),
+        (and_(is_open, Task.status.in_(ACTIVE_STATUSES)), 1),
+        (and_(is_open, Task.due_date == today), 2),
+        else_=3,
+    )
 
 
 def priority_rank():
@@ -194,6 +300,16 @@ def list_tasks(
         description="Show only soft-deleted tasks. Requires include_deleted's authority.",
     ),
     mine: bool = Query(default=False),
+    scope: ScopeFilter | None = Query(
+        default=None,
+        description="Narrow to a working question: today (overdue + due today + in flight + finished today), open, or done.",
+    ),
+    carry_days: int = Query(
+        default=7,
+        ge=0,
+        le=365,
+        description="With scope=today, how far back overdue work carries into the day. 0 means only what is due today.",
+    ),
     sort: SortKey = Query(default="due"),
     order: SortOrder = Query(default="asc"),
     page: int = Query(default=1, ge=1),
@@ -255,12 +371,31 @@ def list_tasks(
             Task.deleted_at.is_(None),
         )
 
-    column = priority_rank() if sort == "priority" else SORT_COLUMNS.get(sort, Task.due_date)
-    descending = order == "desc"
-    if sort == "priority":
-        stmt = stmt.order_by(column.desc() if descending else column.asc(), Task.id.desc())
+    # Kept before the scope is applied so the summary can still report what the
+    # scope left out. `older_overdue` is the count of overdue work that is no
+    # longer today's problem; without it, narrowing the list would silently look
+    # like the backlog had been dealt with.
+    unscoped = stmt
+    stmt = apply_scope(stmt, scope, carry_days)
+
+    if scope == "today":
+        # `sort` is ignored here on purpose: urgency order and the sort key are
+        # two different questions, and answering "what should I do now?" with
+        # "sorted by title" is how the urgent row ends up at the bottom.
+        stmt = stmt.order_by(
+            today_rank(carry_days).asc(),
+            priority_rank().asc(),
+            Task.due_date.is_(None),
+            Task.due_date.asc(),
+            Task.id.desc(),
+        )
     else:
-        stmt = stmt.order_by(column.is_(None), column.desc() if descending else column.asc(), Task.id.desc())
+        column = priority_rank() if sort == "priority" else SORT_COLUMNS.get(sort, Task.due_date)
+        descending = order == "desc"
+        if sort == "priority":
+            stmt = stmt.order_by(column.desc() if descending else column.asc(), Task.id.desc())
+        else:
+            stmt = stmt.order_by(column.is_(None), column.desc() if descending else column.asc(), Task.id.desc())
 
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
     rows = db.scalars(stmt.offset((page - 1) * page_size).limit(page_size)).all()
@@ -272,6 +407,109 @@ def list_tasks(
         total=total,
         page=page,
         page_size=page_size,
+        summary=task_summary(
+            db, stmt, unscoped if scope == "today" else None, carry_days
+        ),
+    )
+
+
+def task_summary(
+    db: Session, stmt: Select, unscoped: Select | None = None, carry_days: int = 7
+) -> TaskSummary:
+    """Counts for the whole filtered set, in two queries.
+
+    The page's own rows are not a summary: fifty per page means the strip read
+    "12 in progress" on page one and "3 in progress" on page two for the same
+    query. These are the numbers for everything the filter matches.
+
+    `unscoped` is the same query before `scope=today` narrowed it, so
+    `older_overdue` can still report the overdue work today's board deliberately
+    left out.
+    """
+    today = local_today()
+    day_start, day_end = today_bounds_utc()
+    sub = stmt.subquery().alias("t")
+    counts = {
+        r[0]: int(r[1])
+        for r in db.execute(
+            select(sub.c.status, func.count()).select_from(sub).group_by(sub.c.status)
+        ).all()
+    }
+    row = db.execute(
+        select(
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(sub.c.due_date == today, sub.c.status != TaskStatus.completed.value),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                sub.c.due_date.is_not(None),
+                                sub.c.due_date < today,
+                                sub.c.status != TaskStatus.completed.value,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(func.sum(case((sub.c.assignee_id.is_(None), 1), else_=0)), 0),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(sub.c.completed_at >= day_start, sub.c.completed_at <= day_end),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+        ).select_from(sub)
+    ).one()
+
+    older_overdue = 0
+    if unscoped is not None:
+        wide = unscoped.subquery().alias("w")
+        older_overdue = int(
+            db.scalar(
+                select(func.count())
+                .select_from(wide)
+                .where(
+                    wide.c.due_date.is_not(None),
+                    wide.c.due_date < today,
+                    wide.c.due_date < today - timedelta(days=carry_days),
+                    wide.c.status != TaskStatus.completed.value,
+                    wide.c.deleted_at.is_(None),
+                )
+            )
+            or 0
+        )
+
+    return TaskSummary(
+        total=sum(counts.values()),
+        by_status={s.value: counts.get(s.value, 0) for s in TaskStatus},
+        due_today=int(row[0]),
+        overdue=int(row[1]),
+        in_progress=counts.get(TaskStatus.in_progress.value, 0),
+        blocked=counts.get(TaskStatus.blocked.value, 0),
+        completed_today=int(row[3]),
+        unassigned=int(row[2]),
+        older_overdue=older_overdue,
+        carry_days=carry_days if unscoped is not None else None,
     )
 
 
@@ -288,6 +526,8 @@ def task_board(
     include_completed: bool = Query(default=False),
     completed_from: date | None = Query(default=None),
     completed_to: date | None = Query(default=None),
+    scope: ScopeFilter | None = Query(default=None),
+    carry_days: int = Query(default=7, ge=0, le=365),
 ):
     """Every visible task bucketed by the person who owns it.
 
@@ -306,7 +546,10 @@ def task_board(
     stmt = _base_query(current).where(Task.deleted_at.is_(None))
     if status:
         stmt = stmt.where(Task.status == status)
-    elif not include_completed:
+    elif scope is None and not include_completed:
+        # `scope` decides membership itself, so it must not also be silently
+        # narrowed by the "hide completed by default" rule -- otherwise
+        # `scope=today` could never show what was finished today.
         stmt = stmt.where(Task.status != TaskStatus.completed.value)
     if priority:
         stmt = stmt.where(Task.priority == priority)
@@ -331,11 +574,24 @@ def task_board(
             Task.completed_at <= datetime.combine(completed_to, datetime.max.time())
         )
 
-    rows = db.scalars(
-        stmt.order_by(
-            Task.due_date.is_(None), Task.due_date.asc(), priority_rank().asc(), Task.id.asc()
+    stmt = apply_scope(stmt, scope, carry_days)
+
+    if scope == "today":
+        order = (
+            today_rank(carry_days).asc(),
+            priority_rank().asc(),
+            Task.due_date.is_(None),
+            Task.due_date.asc(),
+            Task.id.asc(),
         )
-    ).all()
+    else:
+        order = (
+            Task.due_date.is_(None),
+            Task.due_date.asc(),
+            priority_rank().asc(),
+            Task.id.asc(),
+        )
+    rows = db.scalars(stmt.order_by(*order)).all()
     today = local_today()
     now = utcnow()
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -137,14 +139,26 @@ def time_summary(
     Raw per-timer rows stay on the task page; this is the summary people
     actually read. Time accruing on an open timer is included, so the figure
     matches the clock rather than lagging until someone pauses.
-    """
-    from datetime import timedelta
 
+    `days` counts today as one of the days, so `days=1` is today alone and
+    `days=7` is this week. It used to subtract `days` and then truncate to UTC
+    midnight, which made the shortest option a *yesterday plus today* window and
+    put the boundary five and a half hours away from local midnight -- so "today"
+    silently included yesterday evening's hours.
+    """
+    from datetime import timedelta, timezone
+
+    from app.config import settings
     from app.models import User
-    from app.serializers import actor_out
+    from app.serializers import actor_out, local_today
 
     end = utcnow()
-    start = (end - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    first_day = local_today() - timedelta(days=days - 1)
+    start = (
+        datetime.combine(first_day, datetime.min.time(), tzinfo=settings.tz)
+        .astimezone(timezone.utc)
+        .replace(tzinfo=None)
+    )
 
     sees_everyone = policy.can_view_all_tasks(current.user)
 
@@ -218,6 +232,7 @@ def time_summary(
     return TimeSummaryOut(
         scope="company" if sees_everyone else "self",
         days=days,
+        range={"from": start, "to": end},
         total_seconds=sum(p.seconds for p in people),
         people=people,
     )

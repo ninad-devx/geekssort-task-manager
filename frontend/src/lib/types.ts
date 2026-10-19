@@ -93,6 +93,15 @@ export interface Actor {
   id: number;
   full_name: string;
   role: Role;
+  /**
+   * The server now sends these on every actor reference. They used to live only
+   * on the directory, which meant a person could be named on a task but not
+   * pictured or linked to -- the reason the profile appeared on Tracked Time and
+   * nowhere else.
+   */
+  display_name?: string | null;
+  avatar_url?: string | null;
+  avatar_color?: string | null;
 }
 
 export interface RunningTimer {
@@ -107,6 +116,14 @@ export interface RunningTimer {
   user_id: number;
   user: Actor | null;
   is_mine: boolean;
+}
+
+export interface StatusMove {
+  status: TaskStatus;
+  /** The endpoint refuses this move without a reason of at least 3 characters. */
+  requires_reason: boolean;
+  /** The endpoint refuses this move without a note. */
+  requires_note: boolean;
 }
 
 export interface Task {
@@ -138,7 +155,25 @@ export interface Task {
   /** Timers other people have open on this task. */
   other_runners: RunningTimer[];
   allowed_actions: string[];
+  /** Statuses the server will accept from this caller right now, in board order.
+   *  The row renders exactly these, so the control can never offer a move the
+   *  endpoint would reject. Empty means no control. */
+  allowed_statuses: StatusMove[];
   log_count: number;
+}
+
+export interface TaskSummary {
+  total: number;
+  by_status: Record<TaskStatus, number>;
+  due_today: number;
+  overdue: number;
+  in_progress: number;
+  blocked: number;
+  completed_today: number;
+  unassigned: number;
+  /** Overdue work too old to count as today's problem. Only set for scope=today. */
+  older_overdue: number;
+  carry_days: number | null;
 }
 
 export interface TaskList {
@@ -146,6 +181,7 @@ export interface TaskList {
   total: number;
   page: number;
   page_size: number;
+  summary?: TaskSummary | null;
 }
 
 export interface TaskLog {
@@ -210,6 +246,26 @@ export interface DashboardCounts {
   in_progress?: number;
   blocked?: number;
   tracked_seconds: number;
+  /**
+   * What `total` and `by_status` are counting. Under "today" they are today's
+   * focus set, not the whole backlog; under the wider periods they are the
+   * standing totals. A card that cannot say which is mislabelled either way.
+   */
+  scope?: "today" | "all";
+  /** Every live task in scope, regardless of period. */
+  all_time_total?: number;
+  /** Overdue work older than the carry-forward window; reported so the narrowed
+   *  numbers never read as "the backlog is gone". */
+  older_overdue?: number;
+  carry_days?: number | null;
+}
+
+export interface DailyActivity {
+  /** "YYYY-MM-DD" in the app's timezone. */
+  day: string;
+  seconds: number;
+  /** Tasks this person completed that day. */
+  completed: number;
 }
 
 export interface DashboardPayload {
@@ -227,7 +283,7 @@ export interface DashboardPayload {
     blocked: number;
     in_review: number;
   };
-  daily?: { day: string; seconds: number }[];
+  daily?: DailyActivity[];
   running?: RunningTimer | null;
   period?: string;
   period_label?: string;
@@ -244,13 +300,79 @@ export interface WorklistRow {
   title: string;
   status: TaskStatus;
   due_date: string | null;
+  priority?: Priority;
   is_overdue: boolean;
   assignee: PersonRef | null;
 }
 
+/**
+ * One person's whole picture, from `GET /users/{id}/profile`.
+ *
+ * Visible to the person themselves and to the CEO/team lead, so a member reads
+ * exactly the same page a lead reads about them.
+ */
+export interface UserProfile {
+  user: PersonRef & {
+    is_active: boolean;
+    can_review: boolean;
+    is_admin: boolean;
+    created_at: string;
+  };
+  is_self: boolean;
+  server_time: string;
+  app_timezone: string;
+  days: number;
+  range: { from: string; to: string };
+  counts: {
+    total: number;
+    by_status: Record<TaskStatus, number>;
+    open: number;
+    in_progress: number;
+    blocked: number;
+    in_review: number;
+    overdue: number;
+    due_today: number;
+    older_overdue?: number;
+    carry_days?: number;
+    completed_today: number;
+    completed_total: number;
+    /** In the selected window. */
+    tracked_seconds: number;
+    /** Lifetime, across the whole history. */
+    tracked_seconds_total: number;
+  };
+  /** One row per day in the window, including days with nothing logged. */
+  daily: DailyActivity[];
+  days_in_range: string[];
+  tasks: {
+    in_progress: WorklistRow[];
+    overdue: WorklistRow[];
+    due_today: WorklistRow[];
+    completed_today: WorklistRow[];
+  };
+  running: {
+    log_id: number;
+    task_id: number;
+    task_title: string;
+    started_at: string;
+    elapsed_seconds: number;
+    is_stale: boolean;
+  }[];
+  recent_activity: AuditEvent[];
+}
+
 export interface MemberLoad {
-  user: { id: number; full_name: string; role: Role };
+  user: {
+    id: number;
+    full_name: string;
+    role: Role;
+    display_name?: string | null;
+    avatar_url?: string | null;
+    avatar_color?: string | null;
+  };
   open_tasks: number;
+  overdue_count?: number;
+  due_today_count?: number;
   tracked_seconds: number;
 }
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app import aggregate, policy
@@ -12,7 +12,13 @@ from app.db import get_db
 from app.deps import CurrentUser, get_current_user
 from app.errors import forbidden
 from app.models import EntryType, Task, TaskStatus, User, WorkSession, utcnow
-from app.serializers import elapsed, is_stale, local_today, running_session_for_user
+from app.serializers import (
+    elapsed,
+    is_stale,
+    local_today,
+    running_session_for_user,
+    worklist_rows,
+)
 from app.timelog import to_utc
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -137,32 +143,120 @@ def _working_now(db: Session, current: CurrentUser) -> list[dict]:
     return out
 
 
+def _focus_stmt(stmt: Select, today: date, carry_days: int = 7) -> Select:
+    """The set of tasks that belongs to *today* rather than to the whole backlog.
+
+    Identical to `GET /tasks?scope=today`, kept here so the dashboard numbers
+    and the list they link to cannot drift apart. It is only applied for
+    `period=today`; the wider periods keep reporting the standing totals they
+    have always reported.
+    """
+    from app.routers.tasks import ACTIVE_STATUSES
+
+    is_open = Task.status != TaskStatus.completed.value
+    return stmt.where(
+        or_(
+            and_(
+                is_open,
+                Task.due_date.is_not(None),
+                Task.due_date <= today,
+                Task.due_date >= today - timedelta(days=carry_days),
+            ),
+            and_(is_open, Task.status.in_(ACTIVE_STATUSES)),
+            and_(
+                Task.status == TaskStatus.completed.value,
+                Task.completed_at >= start_of_day_utc(today),
+                Task.completed_at <= end_of_day_utc(today),
+            ),
+        )
+    )
+
+
+def start_of_day_utc(day: date) -> datetime:
+    return datetime.combine(day, time.min, tzinfo=settings.tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def end_of_day_utc(day: date) -> datetime:
+    return datetime.combine(day, time.max, tzinfo=settings.tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _member_load(db: Session, task_stmt: Select, start: datetime, end: datetime) -> list[dict]:
     open_stmt = task_stmt.where(Task.status != TaskStatus.completed.value)
     sub = _alias(open_stmt)
+    today = local_today()
+    # Slipping counts come out of the same grouped query rather than a second
+    # round-trip per person.
     rows = db.execute(
-        select(User.id, User.full_name, User.role, func.count(sub.c.id))
+        select(
+            User.id,
+            User.full_name,
+            User.role,
+            User.display_name,
+            User.avatar_url,
+            User.avatar_color,
+            func.count(sub.c.id),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(sub.c.due_date.is_not(None), sub.c.due_date < today),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(func.sum(case((sub.c.due_date == today, 1), else_=0)), 0),
+        )
         .select_from(sub.join(User, User.id == sub.c.assignee_id))
         .where(sub.c.deleted_at.is_(None))
-        .group_by(User.id, User.full_name, User.role)
+        .group_by(
+            User.id, User.full_name, User.role, User.display_name, User.avatar_url, User.avatar_color
+        )
         .order_by(User.full_name)
     ).all()
     # One roll-up for the whole team instead of one per person.
     seconds_by_user = _tracked_by_assignee(db, start, end)
     return [
         {
-            "user": {"id": uid, "full_name": full_name, "role": role},
+            "user": {
+                "id": uid,
+                "full_name": full_name,
+                "role": role,
+                "display_name": display_name,
+                "avatar_url": avatar_url,
+                "avatar_color": avatar_color,
+            },
             "open_tasks": int(open_count),
+            "overdue_count": int(overdue_count),
+            "due_today_count": int(due_today_count),
             "tracked_seconds": seconds_by_user.get(uid, 0),
         }
-        for uid, full_name, role, open_count in rows
+        for uid, full_name, role, display_name, avatar_url, avatar_color, open_count, overdue_count, due_today_count in rows
     ]
 
 
-def _base_payload(db: Session, current: CurrentUser, stmt: Select, start: datetime, end: datetime) -> dict:
-    counts = _status_counts(db, stmt)
-    sub = _alias(stmt)
+def _base_payload(
+    db: Session,
+    current: CurrentUser,
+    stmt: Select,
+    start: datetime,
+    end: datetime,
+    period: str | None = None,
+    carry_days: int = 7,
+) -> dict:
     today = local_today()
+    all_time_total = int(db.scalar(select(func.count()).select_from(_alias(stmt))) or 0)
+
+    # "Today" must mean today. The standing totals (every task ever raised, all
+    # time) were being shown under a Today heading, so the first card read "37
+    # tasks" on a day with three things to do. For this period the roll-up is
+    # taken over today's focus set instead, and the standing figure is reported
+    # separately rather than silently replacing it.
+    today_scope = period == "today"
+    counts = _status_counts(db, _focus_stmt(stmt, today, carry_days) if today_scope else stmt)
+    sub = _alias(stmt)
     overdue = int(
         db.scalar(
             select(func.count()).select_from(sub).where(
@@ -192,6 +286,22 @@ def _base_payload(db: Session, current: CurrentUser, stmt: Select, start: dateti
         )
         or 0
     )
+    # Overdue old enough that today's board deliberately leaves it out. Reported
+    # so the narrowed number never reads as "the backlog is gone".
+    older_overdue = int(
+        db.scalar(
+            select(func.count())
+            .select_from(sub)
+            .where(
+                sub.c.due_date.is_not(None),
+                sub.c.due_date < today,
+                sub.c.due_date < today - timedelta(days=carry_days),
+                sub.c.status != TaskStatus.completed.value,
+                sub.c.deleted_at.is_(None),
+            )
+        )
+        or 0
+    )
     return {
         "server_time": utcnow(),
         "app_timezone": settings.APP_TIMEZONE,
@@ -200,12 +310,18 @@ def _base_payload(db: Session, current: CurrentUser, stmt: Select, start: dateti
             "total": sum(counts.values()),
             "by_status": {s.value: counts.get(s.value, 0) for s in TaskStatus},
             "open": sum(counts.get(s, 0) for s in OPEN_STATUSES),
-            "overdue": overdue,
+            "overdue": overdue - older_overdue if today_scope else overdue,
+            "older_overdue": older_overdue if today_scope else 0,
+            "carry_days": carry_days if today_scope else None,
             "due_today": due_today,
             "completed_in_range": completed,
             "in_progress": counts.get(TaskStatus.in_progress.value, 0),
             "blocked": counts.get(TaskStatus.blocked.value, 0),
             "tracked_seconds": _tracked(db, stmt, start, end),
+            # What `total` and `by_status` are counting, so the client can label
+            # the cards honestly instead of assuming "everything".
+            "scope": "today" if today_scope else "all",
+            "all_time_total": all_time_total,
         },
         "working_now": _working_now(db, current),
     }
@@ -217,12 +333,18 @@ def executive(
     db: Session = Depends(get_db),
     days: int | None = Query(default=None, ge=1, le=90),
     period: str = Query(default="week"),
+    carry_days: int = Query(
+        default=7,
+        ge=0,
+        le=365,
+        description="With period=today, how far back overdue work carries into the day.",
+    ),
 ):
     if not policy.capabilities(current.user)["can_view_executive_dashboard"]:
         raise forbidden("FORBIDDEN", "The executive dashboard is for the CEO and team lead")
     start, end = _window(period, days)
     stmt = _visible_tasks(current)
-    payload = _base_payload(db, current, stmt, start, end)
+    payload = _base_payload(db, current, stmt, start, end, period, carry_days)
     payload["period"] = period
     payload["period_label"] = _period_label(period, days or 7)
     payload["members"] = _member_load(db, stmt, start, end)
@@ -235,6 +357,12 @@ def lead(
     db: Session = Depends(get_db),
     days: int | None = Query(default=None, ge=1, le=90),
     period: str = Query(default="week"),
+    carry_days: int = Query(
+        default=7,
+        ge=0,
+        le=365,
+        description="With period=today, how far back overdue work carries into the day.",
+    ),
     assignee_id: int | None = Query(default=None),
     category: str | None = Query(default=None),
 ):
@@ -246,7 +374,7 @@ def lead(
         stmt = stmt.where(Task.assignee_id == assignee_id)
     if category:
         stmt = stmt.where(Task.category == category)
-    payload = _base_payload(db, current, stmt, start, end)
+    payload = _base_payload(db, current, stmt, start, end, period, carry_days)
     payload["period"] = period
     payload["period_label"] = _period_label(period, days or 7)
     payload["members"] = _member_load(db, stmt, start, end)
@@ -277,33 +405,80 @@ def lead(
     return payload
 
 
-@router.get("/personal")
-def personal(
-    current: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    days: int | None = Query(default=None, ge=1, le=90),
-    period: str = Query(default="week"),
-):
-    start, end = _window(period, days)
-    stmt = select(Task).where(Task.deleted_at.is_(None), Task.assignee_id == current.user.id)
-    payload = _base_payload(db, current, stmt, start, end)
+def _window_local_days(start: datetime, end: datetime) -> list[date]:
+    """Every calendar day the window covers, in APP_TIMEZONE, oldest first."""
+    first = start.replace(tzinfo=timezone.utc).astimezone(settings.tz).date()
+    last = end.replace(tzinfo=timezone.utc).astimezone(settings.tz).date()
+    if last < first:
+        return []
+    return [first + timedelta(days=i) for i in range((last - first).days + 1)]
 
-    daily = db.execute(
-        select(
-            func.date(WorkSession.started_at).label("day"),
-            func.coalesce(aggregate.live_seconds_expr(), 0),
-        )
+
+def _daily_activity(db: Session, user_id: int, start: datetime, end: datetime) -> list[dict]:
+    """Tracked seconds and completed tasks per calendar day, including empty days.
+
+    A row per day, not per day-with-something-in-it. A chart that drops the days
+    somebody did not log makes a quiet Tuesday invisible and reads as "no data"
+    rather than "nothing done", which is the difference between a person who was
+    idle and a bug in the roll-up.
+    """
+    days = _window_local_days(start, end)
+    if not days:
+        return []
+
+    seconds_col = aggregate.local_date_expr(WorkSession.started_at).label("day")
+    seconds_rows = db.execute(
+        select(seconds_col, func.coalesce(aggregate.live_seconds_expr(), 0))
         .where(
-            WorkSession.user_id == current.user.id,
+            WorkSession.user_id == user_id,
             WorkSession.deleted_at.is_(None),
             WorkSession.entry_type == EntryType.work_session.value,
             WorkSession.started_at >= start,
             WorkSession.started_at <= end,
         )
         .group_by("day")
-        .order_by("day")
     ).all()
-    payload["daily"] = [{"day": str(r[0]), "seconds": int(r[1])} for r in daily]
+    by_day: dict[str, dict[str, int]] = {str(d): {"seconds": 0, "completed": 0} for d in days}
+    for day, seconds in seconds_rows:
+        if day is not None:
+            by_day.setdefault(str(day), {"seconds": 0, "completed": 0})["seconds"] = int(seconds or 0)
+
+    done_col = aggregate.local_date_expr(Task.completed_at).label("day")
+    done_rows = db.execute(
+        select(done_col, func.count())
+        .where(
+            Task.assignee_id == user_id,
+            Task.deleted_at.is_(None),
+            Task.completed_at.is_not(None),
+            Task.completed_at >= start,
+            Task.completed_at <= end,
+        )
+        .group_by("day")
+    ).all()
+    for day, count in done_rows:
+        if day is not None:
+            by_day.setdefault(str(day), {"seconds": 0, "completed": 0})["completed"] = int(count or 0)
+
+    return [{"day": str(d), **by_day[str(d)]} for d in days]
+
+
+@router.get("/personal")
+def personal(
+    current: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    days: int | None = Query(default=None, ge=1, le=90),
+    period: str = Query(default="week"),
+    carry_days: int = Query(
+        default=7,
+        ge=0,
+        le=365,
+        description="With period=today, how far back overdue work carries into the day.",
+    ),
+):
+    start, end = _window(period, days)
+    stmt = select(Task).where(Task.deleted_at.is_(None), Task.assignee_id == current.user.id)
+    payload = _base_payload(db, current, stmt, start, end, period, carry_days)
+    payload["daily"] = _daily_activity(db, current.user.id, start, end)
 
     today = local_today()
     sub = _alias(stmt)
@@ -372,65 +547,27 @@ def personal(
 def _worklists(db: Session, stmt: Select, today) -> dict:
     """The four lists the dashboard shows as sections: what is moving, what is
     done, and what is slipping. Cards carry the numbers; these carry the work."""
-    sub = _alias(stmt)
-    base = (sub.c.deleted_at.is_(None),)
-
+    # Conditions are written against `Task`, not against an outer alias. Mixing
+    # a subquery's columns into a `select(Task)` FROM list leaves two
+    # independent FROM elements in the subquery, which SQLAlchemy reports as a
+    # cartesian product -- and the counts silently inflate.
     def rows(*conditions):
-        result = db.execute(
-            select(
-                sub.c.id,
-                sub.c.title,
-                sub.c.status,
-                sub.c.due_date,
-                User.id,
-                User.full_name,
-                User.display_name,
-                User.avatar_url,
-                User.avatar_color,
-                User.role,
-            )
-            .select_from(sub.outerjoin(User, User.id == sub.c.assignee_id))
-            .where(*base, *conditions)
-            .order_by(sub.c.due_date.is_(None), sub.c.due_date.asc(), sub.c.id.asc())
-            .limit(25)
-        ).all()
-        return [
-            {
-                "id": r[0],
-                "title": r[1],
-                "status": r[2],
-                "due_date": str(r[3]) if r[3] else None,
-                "is_overdue": bool(r[3]) and r[3] < today,
-                "assignee": (
-                    {
-                        "id": r[4],
-                        "full_name": r[5],
-                        "display_name": r[6],
-                        "avatar_url": r[7],
-                        "avatar_color": r[8],
-                        "role": r[9],
-                    }
-                    if r[4] is not None
-                    else None
-                ),
-            }
-            for r in result
-        ]
+        return worklist_rows(db, stmt.where(*conditions), today)
 
     return {
-        "in_progress": rows(sub.c.status == TaskStatus.in_progress.value),
+        "in_progress": rows(Task.status == TaskStatus.in_progress.value),
         "completed": rows(
-            sub.c.status == TaskStatus.completed.value,
-            sub.c.completed_at.is_not(None),
+            Task.status == TaskStatus.completed.value,
+            Task.completed_at.is_not(None),
         ),
         "overdue": rows(
-            sub.c.due_date.is_not(None),
-            sub.c.due_date < today,
-            sub.c.status != TaskStatus.completed.value,
+            Task.due_date.is_not(None),
+            Task.due_date < today,
+            Task.status != TaskStatus.completed.value,
         ),
         "blocked": rows(
-            sub.c.status == TaskStatus.blocked.value,
-            sub.c.blocked_reason.is_not(None),
+            Task.status == TaskStatus.blocked.value,
+            Task.blocked_reason.is_not(None),
         ),
     }
 
